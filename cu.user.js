@@ -3,10 +3,10 @@
 // @name:ru      Костыли для Ютуба
 // @name:en      Crutches for YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.1.3
-// @description  КЮ: SponsorBlock-пропуск, fullscreen/exit fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
-// @description:ru КЮ: SponsorBlock-пропуск, fullscreen/exit fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
-// @author       npekpacHo + ChatGPT
+// @version      0.1.4
+// @description  КЮ: SponsorBlock-пропуск, аккуратный fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @description:ru КЮ: SponsorBlock-пропуск, аккуратный fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @author       npekpacHo
 // @license      MIT
 // @homepageURL  https://github.com/npekpacHo/cu
 // @supportURL   https://github.com/npekpacHo/cu/issues
@@ -74,6 +74,13 @@
     */
     fullscreenMode: 'youtube-first',
     allowBrowserFullscreenFallback: true,
+
+    /*
+      Кнопка КЮ использует browser fullscreen напрямую.
+      Это нужно, чтобы она не зависела от капризов штатной кнопки YouTube.
+      Автоматический вход при повороте всё ещё сначала пробует кнопку YouTube.
+    */
+    hintButtonMode: 'browser-first',
 
     /*
       Осторожный выход из fullscreen при возврате из горизонтального положения в вертикальное.
@@ -611,7 +618,7 @@
     return false;
   }
 
-  async function tryBrowserFullscreenFallback() {
+  async function tryBrowserFullscreenFallback(preferVideo = false) {
     if (!CONFIG.allowBrowserFullscreenFallback) return false;
 
     const video = getVideo();
@@ -619,8 +626,15 @@
 
     if (!video) return false;
 
-    if (await requestBrowserFullscreen(player)) return true;
-    if (await requestBrowserFullscreen(video)) return true;
+    /*
+      Для кнопки КЮ можно предпочесть video: это менее красиво, зато чаще работает
+      на мобильном Chrome. Да, дошли до уровня "менее красиво, зато живое".
+    */
+    const targets = preferVideo ? [video, player] : [player, video];
+
+    for (const target of targets) {
+      if (await requestBrowserFullscreen(target)) return true;
+    }
 
     try {
       if (video.webkitEnterFullscreen) {
@@ -649,30 +663,72 @@
     const video = getVideo();
     if (!video) return false;
 
+    const gesture = isGestureReason(reason);
+    const isHint = /hint/i.test(reason || '');
+
     const now = Date.now();
-    if (now - state.lastFullscreenAttemptAtMs < 450) return false;
+
+    /*
+      Не душим реальные пользовательские нажатия таймером.
+      В 0.1.3 это могло мешать кнопке КЮ, потому что сначала прилетала попытка от
+      ориентации, а потом живой человек нажимал кнопку. Человек, конечно, спорное
+      устройство ввода, но иногда он прав.
+    */
+    if (!gesture && now - state.lastFullscreenAttemptAtMs < 450) return false;
     state.lastFullscreenAttemptAtMs = now;
 
     log('try fullscreen', reason);
 
+    /*
+      Кнопка КЮ должна работать сама по себе, а не устраивать двойной toggle штатной
+      кнопки YouTube. Поэтому для неё первым делом используем browser fullscreen.
+    */
+    if (isHint && CONFIG.hintButtonMode === 'browser-first') {
+      if (await tryBrowserFullscreenFallback(true)) {
+        state.fullscreenNeedsGesture = false;
+        hideFullscreenHint();
+        return true;
+      }
+
+      if (clickYoutubeFullscreenButton()) {
+        setTimeout(() => {
+          if (isFullscreenActive()) {
+            state.fullscreenNeedsGesture = false;
+            hideFullscreenHint();
+          } else if (isLandscape()) {
+            state.fullscreenNeedsGesture = true;
+            showFullscreenHint();
+          }
+        }, 350);
+
+        return true;
+      }
+
+      state.fullscreenNeedsGesture = true;
+      showFullscreenHint();
+      return false;
+    }
+
+    /*
+      Автоматический вход по orientationchange не имеет нормальной пользовательской
+      активации, поэтому Chrome может отказать. Пробуем штатную кнопку YouTube,
+      а если результата нет, показываем кнопку КЮ.
+    */
     if (CONFIG.fullscreenMode === 'youtube-first' && clickYoutubeFullscreenButton()) {
       setTimeout(() => {
         if (isFullscreenActive()) {
           state.fullscreenNeedsGesture = false;
           hideFullscreenHint();
+        } else if (isLandscape()) {
+          state.fullscreenNeedsGesture = true;
+          showFullscreenHint();
         }
-      }, 350);
+      }, 500);
 
       return true;
     }
 
-    /*
-      Без жеста пользователя Chrome Android часто запрещает нормальный fullscreen.
-      Поэтому при пассивном событии вроде resize/orientationchange не лезем сразу в
-      браузерный requestFullscreen, а показываем кнопку. Пусть человек один раз ткнёт
-      по экрану, раз уж вся платформа построена на ритуальных прикосновениях.
-    */
-    if (!isGestureReason(reason)) {
+    if (!gesture) {
       state.fullscreenNeedsGesture = true;
       showFullscreenHint();
       return false;
@@ -829,7 +885,7 @@
       const button = document.createElement('button');
       button.id = `${APP_ID}-fullscreen-hint`;
       button.type = 'button';
-      button.textContent = '⛶ На весь экран';
+      button.textContent = '⛶ КЮ fullscreen';
 
       Object.assign(button.style, {
         position: 'fixed',
@@ -850,6 +906,8 @@
         (event) => {
           event.preventDefault();
           event.stopPropagation();
+          if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
           state.fullscreenNeedsGesture = true;
           enterFullscreen('hint-button');
         },
@@ -1075,8 +1133,9 @@
       }
 
       /*
-        В портретном режиме не реагируем как бешеные на любое изменение viewport.
-        Выходим только если до этого были в landscape или fullscreen действительно активен.
+        В портретном режиме выходим только если до этого реально были в landscape
+        или fullscreen явно активен. И больше никаких глобальных "поймаю любой тап
+        и сам нажму fullscreen", потому что именно так рождаются баги с двойным toggle.
       */
       if (state.wasLandscape || isBrowserFullscreenActive() || isYoutubePlayerFullscreenClassActive()) {
         schedulePortraitExit(reason);
@@ -1093,25 +1152,6 @@
         screen.orientation.addEventListener('change', () => onOrientationLikeChange('screen-orientation-change'));
       }
     } catch {}
-
-    /*
-      Повторяем fullscreen только если предыдущая попытка явно упёрлась в необходимость
-      пользовательского жеста. Не трогаем обычные тапы, чтобы не ломать штатные жесты YouTube.
-    */
-    const onUserGesture = () => {
-      if (!state.fullscreenNeedsGesture) return;
-      if (!isLandscape()) return;
-      if (isFullscreenActive()) {
-        state.fullscreenNeedsGesture = false;
-        hideFullscreenHint();
-        return;
-      }
-
-      enterFullscreen('user-gesture');
-    };
-
-    document.addEventListener('pointerup', onUserGesture, true);
-    document.addEventListener('touchend', onUserGesture, true);
   }
 
   function onUrlMaybeChanged(reason = 'url') {
@@ -1176,6 +1216,33 @@
       });
     } catch {}
   }
+
+  /*
+    Мини-диагностика из консоли:
+    window.cuDebug()
+  */
+  window.cuDebug = function cuDebug() {
+    const video = getVideo();
+    const player = getPlayer();
+
+    return {
+      app: APP_SHORT,
+      version: '0.1.4',
+      url: location.href,
+      videoId: getVideoIdFromUrl(),
+      landscape: isLandscape(),
+      browserFullscreen: isBrowserFullscreenActive(),
+      youtubeFullscreen: isYoutubePlayerFullscreenClassActive(),
+      fullscreenActive: isFullscreenActive(),
+      hasVideo: Boolean(video),
+      hasPlayer: Boolean(player),
+      hasYoutubeFullscreenButton: Boolean(findYoutubeFullscreenButton()),
+      fullscreenNeedsGesture: state.fullscreenNeedsGesture,
+      wasLandscape: state.wasLandscape,
+      segments: state.segments.length,
+      loadedVideoId: state.loadedVideoId,
+    };
+  };
 
   function init() {
     state.currentUrl = location.href;
