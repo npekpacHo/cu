@@ -4,7 +4,7 @@
 // @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, exit fullscreen on portrait rotation and double tap ±10s for YouTube mobile web
 // @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, выход из fullscreen при повороте в портрет и двойной тап ±10 секунд для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.0
+// @version      0.2.1
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -1173,10 +1173,10 @@
       const style = document.createElement('style');
       style.id = `${APP_ID}-fs-scaling-fix`;
       style.textContent = `
-        :fullscreen #movie_player,
-        :fullscreen .html5-video-player,
-        :-webkit-full-screen #movie_player,
-        :-webkit-full-screen .html5-video-player {
+        #movie_player:fullscreen,
+        .html5-video-player:fullscreen,
+        #movie_player:-webkit-full-screen,
+        .html5-video-player:-webkit-full-screen {
           width: 100vw !important;
           height: 100vh !important;
           max-width: 100vw !important;
@@ -1185,10 +1185,10 @@
           top: 0 !important;
         }
 
-        :fullscreen #movie_player video.html5-main-video,
-        :fullscreen .html5-video-player video.html5-main-video,
-        :-webkit-full-screen #movie_player video.html5-main-video,
-        :-webkit-full-screen .html5-video-player video.html5-main-video {
+        #movie_player:fullscreen video.html5-main-video,
+        .html5-video-player:fullscreen video.html5-main-video,
+        #movie_player:-webkit-full-screen video.html5-main-video,
+        .html5-video-player:-webkit-full-screen video.html5-main-video {
           width: 100% !important;
           height: 100% !important;
           left: 0 !important;
@@ -1305,10 +1305,12 @@
   window.cuDebug = function cuDebug() {
     const video = getVideo();
     const player = getPlayer();
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement || null;
+    const chromeBottom = document.querySelector('.ytp-chrome-bottom');
 
     return {
       app: APP_SHORT,
-      version: '0.2.0',
+      version: '0.2.1',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -1317,6 +1319,9 @@
       fullscreenActive: isFullscreenActive(),
       hasVideo: Boolean(video),
       hasPlayer: Boolean(player),
+      playerTag: player ? player.tagName : null,
+      playerId: player ? player.id : null,
+      playerClassName: player ? player.className : null,
       hasYoutubeFullscreenButton: Boolean(findYoutubeFullscreenButton()),
       fullscreenNeedsGesture: state.fullscreenNeedsGesture,
       wasLandscape: state.wasLandscape,
@@ -1325,6 +1330,17 @@
       hasFullscreenHint: Boolean(state.fsHintEl),
       segments: state.segments.length,
       loadedVideoId: state.loadedVideoId,
+      /* Диагностика конкретно для проблемы с чёрной полосой / пропавшими кнопками */
+      scalingFixInjected: Boolean(document.getElementById(`${APP_ID}-fs-scaling-fix`)),
+      fullscreenElementTag: fsEl ? fsEl.tagName : null,
+      fullscreenElementId: fsEl ? fsEl.id : null,
+      fullscreenElementClassName: fsEl ? fsEl.className : null,
+      hasChromeBottomInDom: Boolean(chromeBottom),
+      chromeBottomVisible: chromeBottom
+        ? chromeBottom.getBoundingClientRect().width > 0 && chromeBottom.getBoundingClientRect().height > 0
+        : false,
+      videoRect: video ? video.getBoundingClientRect() : null,
+      innerSize: { w: window.innerWidth, h: window.innerHeight },
     };
   };
 
