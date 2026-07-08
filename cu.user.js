@@ -1217,7 +1217,7 @@
 
     return {
       app: APP_SHORT,
-      version: '0.1.4',
+      version: '0.1.5',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
