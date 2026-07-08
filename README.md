@@ -8,5 +8,5 @@
 - рассчитан на Chrome Android + AdGuard.
 
 ```text
-https://npekpacho.github.io/rutubochist/cu.user.js
+https://npekpacho.github.io/cu/cu.user.js
 ```
