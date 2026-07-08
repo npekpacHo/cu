@@ -3,9 +3,9 @@
 // @name:ru      Костыли для Ютуба
 // @name:en      Crutches for YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.1.1
-// @description  КЮ: SponsorBlock-пропуск, fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
-// @description:ru КЮ: SponsorBlock-пропуск, fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @version      0.1.2
+// @description  КЮ: SponsorBlock-пропуск, fullscreen/exit fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @description:ru КЮ: SponsorBlock-пропуск, fullscreen/exit fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
 // @author       npekpacHo
 // @license      MIT
 // @homepageURL  https://github.com/npekpacHo/cu
@@ -75,6 +75,14 @@
     fullscreenMode: 'youtube-first',
     allowBrowserFullscreenFallback: true,
 
+    /*
+      Усиленный выход из fullscreen при возврате в портретную ориентацию.
+      На мобильном YouTube есть несколько разных "полноэкранных режимов":
+      браузерный Fullscreen API, штатный YouTube-fullscreen и их мутные гибриды.
+      Поэтому при повороте в портрет пробуем выйти несколько раз разными способами.
+    */
+    portraitExitRetriesMs: [0, 180, 450, 900, 1500],
+
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
     doubleTapMaxDelayMs: 360,
@@ -106,6 +114,7 @@
 
     fullscreenNeedsGesture: false,
     lastFullscreenAttemptAtMs: 0,
+    portraitExitTimerIds: [],
 
     lastTap: {
       time: 0,
@@ -526,14 +535,34 @@
   function isYoutubeFullscreenActive() {
     try {
       const player = getPlayer();
-      return Boolean(
+
+      if (
         player &&
-          (
-            player.classList?.contains('ytp-fullscreen') ||
-            player.classList?.contains('fullscreen') ||
-            document.querySelector('.ytp-fullscreen')
-          )
-      );
+        (
+          player.classList?.contains('ytp-fullscreen') ||
+          player.classList?.contains('fullscreen') ||
+          player.hasAttribute?.('fullscreen')
+        )
+      ) {
+        return true;
+      }
+
+      if (
+        document.querySelector(
+          [
+            '.html5-video-player.ytp-fullscreen',
+            '.html5-video-player.fullscreen',
+            'ytm-player[fullscreen]',
+            'ytm-player.fullscreen',
+            '.ytp-fullscreen',
+          ].join(','),
+        )
+      ) {
+        return true;
+      }
+
+      const exitButton = findYoutubeExitFullscreenButton();
+      return Boolean(exitButton);
     } catch {
       return false;
     }
@@ -552,6 +581,20 @@
     return isBrowserFullscreenActive() || isYoutubeFullscreenActive();
   }
 
+  function getButtonText(button) {
+    try {
+      return [
+        button.getAttribute('aria-label') || '',
+        button.getAttribute('title') || '',
+        button.textContent || '',
+      ]
+        .join(' ')
+        .toLowerCase();
+    } catch {
+      return '';
+    }
+  }
+
   function findYoutubeFullscreenButton() {
     const selectors = [
       '.ytp-fullscreen-button',
@@ -560,11 +603,37 @@
       'button[aria-label*="fullscreen"]',
       'button[aria-label*="Во весь экран"]',
       'button[aria-label*="полноэкран"]',
+      'button[title*="Full screen"]',
+      'button[title*="fullscreen"]',
+      'button[title*="Во весь экран"]',
+      'button[title*="полноэкран"]',
     ];
 
     for (const selector of selectors) {
       const button = document.querySelector(selector);
       if (button) return button;
+    }
+
+    return null;
+  }
+
+  function findYoutubeExitFullscreenButton() {
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+
+    const exitNeedles = [
+      'exit full screen',
+      'exit fullscreen',
+      'выйти из полноэкран',
+      'выйти из полноэкранного',
+      'закрыть полноэкран',
+      'не во весь экран',
+    ];
+
+    for (const button of buttons) {
+      const text = getButtonText(button);
+      if (exitNeedles.some((needle) => text.includes(needle))) {
+        return button;
+      }
     }
 
     return null;
@@ -580,6 +649,60 @@
     } catch {
       return false;
     }
+  }
+
+  function clickYoutubeExitFullscreenButton() {
+    try {
+      const exitButton = findYoutubeExitFullscreenButton();
+      if (exitButton) {
+        exitButton.click();
+        return true;
+      }
+
+      /*
+        Если явной кнопки \"выйти\" не нашли, но сам плеер уверен, что он fullscreen,
+        жмём обычную кнопку fullscreen как toggle. Это безопаснее, чем жать её всегда:
+        иначе при портретной ориентации можно случайно войти в fullscreen обратно.
+      */
+      if (isYoutubeFullscreenActive()) {
+        const fullscreenButton = findYoutubeFullscreenButton();
+        if (fullscreenButton) {
+          fullscreenButton.click();
+          return true;
+        }
+      }
+    } catch {}
+
+    return false;
+  }
+
+  function callYoutubeExitFullscreenApi() {
+    try {
+      const candidates = [
+        document.querySelector('#movie_player'),
+        document.querySelector('.html5-video-player'),
+        getPlayer(),
+      ].filter(Boolean);
+
+      for (const player of candidates) {
+        if (typeof player.setFullscreen === 'function') {
+          player.setFullscreen(false);
+          return true;
+        }
+
+        if (typeof player.exitFullscreen === 'function') {
+          player.exitFullscreen();
+          return true;
+        }
+
+        if (typeof player.cancelFullscreen === 'function') {
+          player.cancelFullscreen();
+          return true;
+        }
+      }
+    } catch {}
+
+    return false;
   }
 
   async function requestBrowserFullscreen(target) {
@@ -680,43 +803,96 @@
     return false;
   }
 
-  async function exitFullscreen() {
-    if (!CONFIG.exitFullscreenOnPortrait) return;
+  function clearPortraitExitTimers() {
+    try {
+      for (const timerId of state.portraitExitTimerIds) {
+        clearTimeout(timerId);
+      }
+      state.portraitExitTimerIds = [];
+    } catch {}
+  }
 
-    state.fullscreenNeedsGesture = false;
-    hideFullscreenHint();
+  async function exitBrowserFullscreen() {
+    let done = false;
 
     try {
       if (document.fullscreenElement && document.exitFullscreen) {
         await document.exitFullscreen();
-        return;
+        done = true;
       }
     } catch {}
 
     try {
       if (document.webkitFullscreenElement && document.webkitExitFullscreen) {
         document.webkitExitFullscreen();
+        done = true;
       }
     } catch {}
 
-    /*
-      Если YouTube держит свой псевдо-fullscreen, пробуем выйти его же кнопкой.
-      Проверяем landscape отдельно, чтобы не устроить toggle туда-сюда.
-    */
     try {
-      if (!isLandscape() && isYoutubeFullscreenActive()) {
-        clickYoutubeFullscreenButton();
+      if (document.mozFullScreenElement && document.mozCancelFullScreen) {
+        document.mozCancelFullScreen();
+        done = true;
       }
     } catch {}
+
+    try {
+      if (document.msFullscreenElement && document.msExitFullscreen) {
+        document.msExitFullscreen();
+        done = true;
+      }
+    } catch {}
+
+    return done;
+  }
+
+  async function exitFullscreen(reason = 'portrait') {
+    if (!CONFIG.exitFullscreenOnPortrait) return false;
+
+    state.fullscreenNeedsGesture = false;
+    hideFullscreenHint();
+
+    let done = false;
+
+    if (await exitBrowserFullscreen()) done = true;
+    if (callYoutubeExitFullscreenApi()) done = true;
+
+    /*
+      YouTube на мобильном может держать не настоящий browser fullscreen, а свой
+      псевдо-fullscreen. Выходим через его кнопку только когда есть явные признаки,
+      что мы именно выходим, а не случайно включаем fullscreen заново.
+    */
+    if (!isLandscape() && clickYoutubeExitFullscreenButton()) done = true;
+
+    log('exit fullscreen', { reason, done });
+
+    return done;
+  }
+
+  function schedulePortraitExit(reason = 'portrait') {
+    if (!CONFIG.exitFullscreenOnPortrait) return;
+
+    clearPortraitExitTimers();
+
+    for (const delay of CONFIG.portraitExitRetriesMs) {
+      const timerId = setTimeout(() => {
+        if (!isLandscape()) {
+          exitFullscreen(`${reason}:${delay}`);
+        }
+      }, delay);
+
+      state.portraitExitTimerIds.push(timerId);
+    }
   }
 
   function syncFullscreen(reason = 'sync') {
-    if (!CONFIG.autoFullscreenOnLandscape) return;
+    if (!CONFIG.autoFullscreenOnLandscape && !CONFIG.exitFullscreenOnPortrait) return;
 
     if (isLandscape()) {
+      clearPortraitExitTimers();
       enterFullscreen(reason);
     } else {
-      exitFullscreen();
+      schedulePortraitExit(reason);
     }
   }
 
@@ -971,8 +1147,66 @@
   }
 
   function installFullscreenWatchers() {
-    window.addEventListener('orientationchange', () => syncFullscreenSoon('orientationchange'), { passive: true });
-    window.addEventListener('resize', () => syncFullscreenSoon('resize'), { passive: true });
+    const onOrientationLikeChange = (reason) => {
+      if (isLandscape()) {
+        syncFullscreenSoon(reason);
+      } else {
+        /*
+          Выход из fullscreen при повороте в портрет должен быть быстрее входа в fullscreen.
+          Иначе пользователь видит вертикальный телефон, горизонтальный плеер и начинает
+          подозревать, что цивилизация свернула не туда. Подозрение, конечно, справедливое.
+        */
+        schedulePortraitExit(reason);
+      }
+    };
+
+    window.addEventListener('orientationchange', () => onOrientationLikeChange('orientationchange'), { passive: true });
+    window.addEventListener('resize', () => onOrientationLikeChange('resize'), { passive: true });
+
+    try {
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', () => onOrientationLikeChange('visualViewport-resize'), {
+          passive: true,
+        });
+      }
+    } catch {}
+
+    try {
+      if (screen.orientation && typeof screen.orientation.addEventListener === 'function') {
+        screen.orientation.addEventListener('change', () => onOrientationLikeChange('screen-orientation-change'));
+      } else if (screen.orientation) {
+        screen.orientation.onchange = () => onOrientationLikeChange('screen-orientation-onchange');
+      }
+    } catch {}
+
+    try {
+      const portraitQuery = window.matchMedia && window.matchMedia('(orientation: portrait)');
+      if (portraitQuery) {
+        const onMediaChange = () => onOrientationLikeChange('matchMedia-orientation');
+
+        if (typeof portraitQuery.addEventListener === 'function') {
+          portraitQuery.addEventListener('change', onMediaChange);
+        } else if (typeof portraitQuery.addListener === 'function') {
+          portraitQuery.addListener(onMediaChange);
+        }
+      }
+    } catch {}
+
+    document.addEventListener(
+      'fullscreenchange',
+      () => {
+        if (!isLandscape()) schedulePortraitExit('fullscreenchange');
+      },
+      true,
+    );
+
+    document.addEventListener(
+      'webkitfullscreenchange',
+      () => {
+        if (!isLandscape()) schedulePortraitExit('webkitfullscreenchange');
+      },
+      true,
+    );
 
     /*
       Повторяем fullscreen только если предыдущая попытка явно упёрлась в необходимость
