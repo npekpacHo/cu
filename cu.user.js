@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, exit fullscreen on portrait rotation and double tap ±10s for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, выход из fullscreen при повороте в портрет и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, custom player controls and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, свои кнопки плеера и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.2
+// @version      0.2.4
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -86,9 +86,7 @@
     allowBrowserFullscreenFallback: true,
 
     /*
-      Кнопка КЮ использует browser fullscreen напрямую (на контейнере плеера,
-      не на <video> — см. tryBrowserFullscreenFallback и
-      injectFullscreenScalingFix, 0.2.0).
+      Кнопка КЮ использует browser fullscreen напрямую.
       Это нужно, чтобы она не зависела от штатной кнопки YouTube.
       Автоматический вход при повороте всё ещё сначала пробует кнопку YouTube.
     */
@@ -100,6 +98,24 @@
       fullscreen от самой кнопки fullscreen. Абсурд, но мы же в вебе.
     */
     portraitExitRetriesMs: [0, 250, 700, 1300],
+
+    /*
+      Свои кнопки поверх плеера.
+      Нужны для режимов, где YouTube-оверлеи пропадают: -10 / play-pause / +10.
+    */
+    customControlsEnabled: true,
+    customControlsShowInLandscape: true,
+    customControlsShowInFullscreen: true,
+    customControlsAlwaysVisible: true,
+    customControlsAutoHideMs: 3500,
+    customControlsSeekSeconds: 10,
+
+    /*
+      Для своих кнопок fullscreen стараемся делать на контейнер плеера, а не на <video>.
+      Если fullscreen-ить само видео, DOM-кнопки поверх него могут не отображаться вообще.
+    */
+    preferPlayerContainerFullscreen: true,
+    allowVideoElementFullscreenFallback: false,
 
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
@@ -128,6 +144,8 @@
     lastSkipAtMs: 0,
 
     fsHintEl: null,
+    customControlsEl: null,
+    customControlsHideTimer: 0,
     observer: null,
 
     fullscreenNeedsGesture: false,
@@ -515,6 +533,8 @@
       state.boundVideo.removeEventListener('seeking', runSkipCheck);
       state.boundVideo.removeEventListener('loadedmetadata', onVideoMetadata);
       state.boundVideo.removeEventListener('play', onVideoPlay);
+      state.boundVideo.removeEventListener('pause', updateCustomControls);
+      state.boundVideo.removeEventListener('timeupdate', updateCustomControls);
     }
 
     state.boundVideo = video;
@@ -523,6 +543,8 @@
     video.addEventListener('seeking', runSkipCheck, { passive: true });
     video.addEventListener('loadedmetadata', onVideoMetadata, { passive: true });
     video.addEventListener('play', onVideoPlay, { passive: true });
+    video.addEventListener('pause', updateCustomControls, { passive: true });
+    video.addEventListener('timeupdate', updateCustomControls, { passive: true });
 
     scheduleRefresh('bind-video');
     syncFullscreenSoon('bind-video');
@@ -636,37 +658,46 @@
     const video = getVideo();
     const player = getPlayer();
 
-    if (!video) return false;
+    if (!player && !video) return false;
 
     /*
-      0.2.0: раньше preferVideo=true отправлял в fullscreen сам <video>,
-      что на некоторых сборках Chrome/Xiaomi лечило чёрную полосу слева —
-      но заодно ломало кнопки управления YouTube, потому что .ytp-chrome-bottom
-      и .ytp-chrome-top не являются потомками <video> и не попадают в
-      fullscreen-поддерево вообще.
-
-      Теперь всегда фуллскрин контейнера плеера (в нём остаются все кнопки),
-      а неправильный скейлинг видео чиним отдельно через CSS в
-      applyFullscreenScalingFix(). preferVideo оставлен только как параметр
-      совместимости и на реальный порядок целей больше не влияет.
+      0.2.4:
+      Сначала fullscreen-им контейнер плеера. Если fullscreen-ить сам <video>,
+      поверх него часто невозможно нормально вывести наши DOM-кнопки.
+      Человечество зачем-то разрешило этот режим, а теперь мы ходим вокруг него с лопатой.
     */
-    const targets = [player, video];
+    const containerTargets = [
+      document.querySelector('#movie_player'),
+      document.querySelector('.html5-video-player'),
+      document.querySelector('ytm-player'),
+      document.querySelector('.player-container-id'),
+      document.querySelector('.player-container'),
+      player,
+    ].filter(Boolean);
+
+    const targets = CONFIG.preferPlayerContainerFullscreen
+      ? Array.from(new Set(containerTargets))
+      : Array.from(new Set(preferVideo ? [video, ...containerTargets] : [...containerTargets, video]));
 
     for (const target of targets) {
+      if (!target) continue;
+      if (target === video && !CONFIG.allowVideoElementFullscreenFallback) continue;
       if (await requestBrowserFullscreen(target)) return true;
     }
 
     /*
-      Последний резерв: нативный fullscreen video (webkitEnterFullscreen).
-      Он тоже прячет кнопки YouTube, поэтому используется только если
-      fullscreen контейнера в принципе недоступен.
+      Fallback на <video> оставлен выключенным по умолчанию.
+      Включать его можно только если снова захочется смотреть на голое видео без кнопок,
+      то есть если день совсем не задался.
     */
-    try {
-      if (video.webkitEnterFullscreen) {
-        video.webkitEnterFullscreen();
-        return true;
-      }
-    } catch {}
+    if (CONFIG.allowVideoElementFullscreenFallback && video) {
+      try {
+        if (video.webkitEnterFullscreen) {
+          video.webkitEnterFullscreen();
+          return true;
+        }
+      } catch {}
+    }
 
     return false;
   }
@@ -706,9 +737,10 @@
       кнопки YouTube. Поэтому для неё первым делом используем browser fullscreen.
     */
     if (isHint && CONFIG.hintButtonMode === 'browser-first') {
-      if (await tryBrowserFullscreenFallback(true)) {
+      if (await tryBrowserFullscreenFallback(false)) {
         state.fullscreenNeedsGesture = false;
         hideFullscreenHint();
+        showCustomControls('fullscreen-button');
         return true;
       }
 
@@ -717,6 +749,7 @@
           if (isFullscreenActive()) {
             state.fullscreenNeedsGesture = false;
             hideFullscreenHint();
+            showCustomControls('youtube-fullscreen-button');
           } else if (isLandscape()) {
             state.fullscreenNeedsGesture = true;
             showFullscreenHint();
@@ -877,22 +910,28 @@
       state.wasLandscape = true;
 
       /*
-        В 0.1.9 больше не включаем fullscreen автоматически при повороте.
-        Только показываем удобную кнопку. Да, всего лишь кнопка. Иногда это
-        надёжнее, чем героически ломать YouTube ради одной автоматизации.
+        0.2.4:
+        fullscreen автоматически не включаем. В landscape показываем нашу кнопку.
+        Если fullscreen уже активен, показываем свои кнопки плеера.
       */
       if (isFullscreenActive()) {
         hideFullscreenHint();
-      } else if (CONFIG.showFullscreenHintOnLandscape) {
-        showFullscreenHint();
-      } else if (CONFIG.autoEnterFullscreenOnLandscape) {
-        enterFullscreen(reason);
+        syncCustomControls(reason);
+      } else {
+        hideCustomControls();
+
+        if (CONFIG.showFullscreenHintOnLandscape) {
+          showFullscreenHint();
+        } else if (CONFIG.autoEnterFullscreenOnLandscape) {
+          enterFullscreen(reason);
+        }
       }
 
       return;
     }
 
     hideFullscreenHint();
+    hideCustomControls();
 
     /*
       Выходим из fullscreen только если до этого реально были в горизонтальном режиме
@@ -944,6 +983,7 @@
           if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
 
           state.fullscreenNeedsGesture = true;
+          ensureCustomControls();
           enterFullscreen('hint-button');
         },
         true,
@@ -963,6 +1003,233 @@
     } catch {}
   }
 
+
+  function getFullscreenElement() {
+    return (
+      document.fullscreenElement ||
+      document.webkitFullscreenElement ||
+      document.mozFullScreenElement ||
+      document.msFullscreenElement ||
+      null
+    );
+  }
+
+  function getCustomControlsRoot() {
+    const fsElement = getFullscreenElement();
+
+    /*
+      Если fullscreen-элементом вдруг оказался <video>, внутрь него DOM-кнопки не положить.
+      Поэтому основной путь 0.2.4 — fullscreen контейнера, а не видео.
+    */
+    if (fsElement && fsElement.tagName && fsElement.tagName.toLowerCase() !== 'video') {
+      return fsElement;
+    }
+
+    return (
+      document.querySelector('#movie_player') ||
+      document.querySelector('.html5-video-player') ||
+      document.querySelector('ytm-player') ||
+      getPlayer() ||
+      document.body ||
+      document.documentElement
+    );
+  }
+
+  function shouldShowCustomControls() {
+    if (!CONFIG.customControlsEnabled) return false;
+    if (!isWatchLikePage()) return false;
+    if (!getVideo()) return false;
+
+    return (
+      (CONFIG.customControlsShowInFullscreen && isFullscreenActive()) ||
+      (CONFIG.customControlsShowInLandscape && isLandscape())
+    );
+  }
+
+  function createCustomControlButton(text, title, handler, extraClass = '') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    button.title = title;
+    button.setAttribute('aria-label', title);
+    button.className = `${APP_ID}-control-button ${extraClass}`.trim();
+
+    Object.assign(button.style, {
+      minWidth: extraClass.includes('play') ? '64px' : '58px',
+      height: '48px',
+      padding: '0 12px',
+      border: '0',
+      borderRadius: '16px',
+      background: 'rgba(0, 0, 0, 0.72)',
+      color: '#fff',
+      font: extraClass.includes('play')
+        ? '22px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif'
+        : '17px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      fontWeight: '700',
+      boxShadow: '0 4px 18px rgba(0,0,0,.35)',
+      pointerEvents: 'auto',
+      touchAction: 'manipulation',
+      userSelect: 'none',
+      WebkitTapHighlightColor: 'transparent',
+    });
+
+    button.addEventListener(
+      'click',
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
+        handler();
+        showCustomControls('button');
+      },
+      true,
+    );
+
+    return button;
+  }
+
+  function updateCustomControls() {
+    const el = state.customControlsEl;
+    const video = getVideo();
+
+    if (!el || !video) return;
+
+    const playButton = el.querySelector(`.${APP_ID}-control-play`);
+    if (playButton) {
+      playButton.textContent = video.paused ? '▶' : '⏸';
+      playButton.title = video.paused ? 'Воспроизвести' : 'Пауза';
+      playButton.setAttribute('aria-label', playButton.title);
+    }
+  }
+
+  function ensureCustomControls() {
+    if (!CONFIG.customControlsEnabled) return null;
+
+    const root = getCustomControlsRoot();
+    if (!root) return null;
+
+    if (!state.customControlsEl) {
+      const wrap = document.createElement('div');
+      wrap.id = `${APP_ID}-custom-controls`;
+
+      Object.assign(wrap.style, {
+        position: 'fixed',
+        left: '50%',
+        bottom: '18px',
+        transform: 'translateX(-50%)',
+        zIndex: '2147483647',
+        display: 'none',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: '10px',
+        padding: '8px',
+        borderRadius: '22px',
+        background: 'rgba(0, 0, 0, 0.18)',
+        backdropFilter: 'blur(3px)',
+        WebkitBackdropFilter: 'blur(3px)',
+        pointerEvents: 'none',
+      });
+
+      const back = createCustomControlButton(
+        '↶10',
+        'Назад на 10 секунд',
+        () => seekBy(-CONFIG.customControlsSeekSeconds),
+      );
+
+      const play = createCustomControlButton(
+        '▶',
+        'Воспроизвести / пауза',
+        () => togglePlayPause(),
+        `${APP_ID}-control-play`,
+      );
+
+      const forward = createCustomControlButton(
+        '10↷',
+        'Вперёд на 10 секунд',
+        () => seekBy(CONFIG.customControlsSeekSeconds),
+      );
+
+      wrap.appendChild(back);
+      wrap.appendChild(play);
+      wrap.appendChild(forward);
+
+      state.customControlsEl = wrap;
+    }
+
+    if (state.customControlsEl.parentNode !== root) {
+      root.appendChild(state.customControlsEl);
+    }
+
+    updateCustomControls();
+    return state.customControlsEl;
+  }
+
+  function showCustomControls(reason = 'show') {
+    if (!shouldShowCustomControls()) {
+      hideCustomControls();
+      return;
+    }
+
+    const el = ensureCustomControls();
+    if (!el) return;
+
+    el.style.display = 'flex';
+    el.style.opacity = '1';
+    updateCustomControls();
+
+    clearTimeout(state.customControlsHideTimer);
+
+    if (!CONFIG.customControlsAlwaysVisible) {
+      state.customControlsHideTimer = setTimeout(() => {
+        hideCustomControls();
+      }, CONFIG.customControlsAutoHideMs);
+    }
+
+    log('show custom controls', reason);
+  }
+
+  function hideCustomControls() {
+    try {
+      clearTimeout(state.customControlsHideTimer);
+
+      if (state.customControlsEl) {
+        state.customControlsEl.style.display = 'none';
+      }
+    } catch {}
+  }
+
+  async function togglePlayPause() {
+    const video = getVideo();
+    if (!video) return false;
+
+    try {
+      if (video.paused) {
+        const result = video.play();
+        if (result && typeof result.catch === 'function') {
+          result.catch((error) => log('video.play failed:', error));
+        }
+      } else {
+        video.pause();
+      }
+
+      setTimeout(updateCustomControls, 80);
+      return true;
+    } catch (error) {
+      log('toggle play failed:', error);
+      return false;
+    }
+  }
+
+  function syncCustomControls(reason = 'sync') {
+    if (shouldShowCustomControls()) {
+      showCustomControls(reason);
+    } else {
+      hideCustomControls();
+    }
+  }
+
+
   function isInteractiveTarget(target) {
     try {
       if (!target || target.nodeType !== 1) return false;
@@ -971,6 +1238,7 @@
         target.closest(
           [
             `#${APP_ID}-fullscreen-hint`,
+            `#${APP_ID}-custom-controls`,
             `#${APP_ID}-toast`,
             'a',
             'button',
@@ -1041,6 +1309,7 @@
     try {
       video.currentTime = target;
       toast(`${APP_SHORT}: ${seconds > 0 ? '+' : ''}${seconds} секунд`, 700);
+      updateCustomControls();
       return true;
     } catch (error) {
       log('double tap seek failed:', error);
@@ -1154,52 +1423,6 @@
     );
   }
 
-  /*
-    0.2.0: CSS-фикс скейлинга видео в fullscreen контейнера плеера.
-
-    Раньше чёрная полоса слева на Xiaomi лечилась тем, что в fullscreen уходил
-    сам <video> (нативный скейлинг браузера), но это прятало кнопки YouTube.
-    Теперь фуллскрин всегда на контейнере, а видео внутри принудительно
-    растягивается на 100% с object-fit: contain — это тот же эффект
-    (видео целиком видно, без обрезки), но без потери кнопок, потому что
-    сами кнопки — часть того же контейнера и просто лежат поверх (z-index
-    у YouTube уже настроен правильно, мы его не трогаем).
-  */
-  function injectFullscreenScalingFix() {
-    try {
-      if (document.getElementById(`${APP_ID}-fs-scaling-fix`)) return;
-      if (!document.head && !document.documentElement) return;
-
-      const style = document.createElement('style');
-      style.id = `${APP_ID}-fs-scaling-fix`;
-      style.textContent = `
-        #movie_player:fullscreen,
-        .html5-video-player:fullscreen,
-        #movie_player:-webkit-full-screen,
-        .html5-video-player:-webkit-full-screen {
-          width: 100vw !important;
-          height: 100vh !important;
-          max-width: 100vw !important;
-          max-height: 100vh !important;
-        }
-
-        #movie_player:fullscreen video.html5-main-video,
-        .html5-video-player:fullscreen video.html5-main-video,
-        #movie_player:-webkit-full-screen video.html5-main-video,
-        .html5-video-player:-webkit-full-screen video.html5-main-video {
-          width: 100% !important;
-          height: 100% !important;
-          object-fit: contain !important;
-        }
-      `;
-
-      (document.head || document.documentElement).appendChild(style);
-      log('fullscreen scaling fix injected');
-    } catch (error) {
-      log('failed to inject fullscreen scaling fix:', error);
-    }
-  }
-
   function installFullscreenWatchers() {
     const onOrientationLikeChange = (reason) => {
       const landscape = isLandscape();
@@ -1218,11 +1441,29 @@
         schedulePortraitExit(reason);
       }
 
+      hideFullscreenHint();
+      hideCustomControls();
       state.wasLandscape = false;
+    };
+
+    const onFullscreenLikeChange = () => {
+      if (isFullscreenActive()) {
+        hideFullscreenHint();
+        syncCustomControls('fullscreenchange');
+      } else {
+        hideCustomControls();
+
+        if (isLandscape() && CONFIG.showFullscreenHintOnLandscape) {
+          showFullscreenHint();
+        }
+      }
     };
 
     window.addEventListener('orientationchange', () => onOrientationLikeChange('orientationchange'), { passive: true });
     window.addEventListener('resize', () => onOrientationLikeChange('resize'), { passive: true });
+
+    document.addEventListener('fullscreenchange', onFullscreenLikeChange, true);
+    document.addEventListener('webkitfullscreenchange', onFullscreenLikeChange, true);
 
     try {
       if (screen.orientation && typeof screen.orientation.addEventListener === 'function') {
@@ -1242,6 +1483,7 @@
     state.lastSkipKey = '';
     state.lastSkipAtMs = 0;
     state.lastTap.time = 0;
+    hideCustomControls();
 
     scheduleBind();
     scheduleRefresh(reason);
@@ -1301,12 +1543,10 @@
   window.cuDebug = function cuDebug() {
     const video = getVideo();
     const player = getPlayer();
-    const fsEl = document.fullscreenElement || document.webkitFullscreenElement || null;
-    const chromeBottom = document.querySelector('.ytp-chrome-bottom');
 
     return {
       app: APP_SHORT,
-      version: '0.2.2',
+      version: '0.2.4',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -1315,28 +1555,18 @@
       fullscreenActive: isFullscreenActive(),
       hasVideo: Boolean(video),
       hasPlayer: Boolean(player),
-      playerTag: player ? player.tagName : null,
-      playerId: player ? player.id : null,
-      playerClassName: player ? player.className : null,
       hasYoutubeFullscreenButton: Boolean(findYoutubeFullscreenButton()),
       fullscreenNeedsGesture: state.fullscreenNeedsGesture,
       wasLandscape: state.wasLandscape,
       autoEnterFullscreenOnLandscape: CONFIG.autoEnterFullscreenOnLandscape,
       showFullscreenHintOnLandscape: CONFIG.showFullscreenHintOnLandscape,
+      customControlsEnabled: CONFIG.customControlsEnabled,
       hasFullscreenHint: Boolean(state.fsHintEl),
+      hasCustomControls: Boolean(state.customControlsEl),
+      customControlsVisible: Boolean(state.customControlsEl && state.customControlsEl.style.display !== 'none'),
+      fullscreenElementTag: (getFullscreenElement() && getFullscreenElement().tagName) || '',
       segments: state.segments.length,
       loadedVideoId: state.loadedVideoId,
-      /* Диагностика конкретно для проблемы с чёрной полосой / пропавшими кнопками */
-      scalingFixInjected: Boolean(document.getElementById(`${APP_ID}-fs-scaling-fix`)),
-      fullscreenElementTag: fsEl ? fsEl.tagName : null,
-      fullscreenElementId: fsEl ? fsEl.id : null,
-      fullscreenElementClassName: fsEl ? fsEl.className : null,
-      hasChromeBottomInDom: Boolean(chromeBottom),
-      chromeBottomVisible: chromeBottom
-        ? chromeBottom.getBoundingClientRect().width > 0 && chromeBottom.getBoundingClientRect().height > 0
-        : false,
-      videoRect: video ? video.getBoundingClientRect() : null,
-      innerSize: { w: window.innerWidth, h: window.innerHeight },
     };
   };
 
@@ -1344,7 +1574,6 @@
     state.currentUrl = location.href;
     state.wasLandscape = isLandscape();
 
-    injectFullscreenScalingFix();
     installRouteWatchers();
     installFullscreenWatchers();
     installDoubleTapSeek();
@@ -1359,6 +1588,7 @@
         scheduleBind();
         scheduleRefresh('visibility');
         syncFullscreenSoon('visibility');
+        syncCustomControls('visibility');
       }
     });
   }
