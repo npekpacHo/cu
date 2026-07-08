@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen on rotation and double tap ±10s for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), полноэкранный режим при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), clean fullscreen on rotation and double tap ±10s for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), аккуратный полноэкранный режим при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.1.7
+// @version      0.1.8
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -71,29 +71,25 @@
       Браузерный requestFullscreen используется только запасным вариантом.
       Именно он на некоторых телефонах превращает плеер в чёрную полосу с видео, приклеенным к правому краю.
     */
-    fullscreenMode: 'youtube-first',
+    /*
+      Безопасный fullscreen.
+
+      В 0.1.7 авто-вход через внутренние методы YouTube/голый video fullscreen
+      мог включать режим без оверлеев YouTube: чёрная полоса слева, нет play/pause
+      и нет штатной перемотки. Поэтому авто-режим теперь использует только
+      штатную кнопку fullscreen самого YouTube.
+    */
+    fullscreenMode: 'youtube-button-only',
     allowBrowserFullscreenFallback: true,
-
-    /*
-      Кнопка КЮ использует browser fullscreen напрямую.
-      Это нужно, чтобы она не зависела от штатной кнопки YouTube.
-      Автоматический вход при повороте всё ещё сначала пробует кнопку YouTube.
-    */
-    hintButtonMode: 'browser-first',
-
-    /*
-      Автовход в fullscreen при повороте приходится делать серией попыток.
-      YouTube Mobile иногда создаёт кнопку/контролы не сразу после resize/orientationchange.
-      Псевдо-fullscreen из 0.1.6 убран: он ломал родные оверлеи плеера.
-    */
-    autoFullscreenRetryMs: [0, 80, 180, 360, 700, 1200, 2000],
+    allowVideoElementFullscreenFallback: false,
+    autoFullscreenAttemptDelaysMs: [0, 80, 180, 360, 700, 1200, 2000],
     pokeControlsBeforeAutoFullscreen: true,
 
     /*
-      В настоящем YouTube-fullscreen не перехватываем двойной тап, чтобы не прятать
-      родные значки перемотки и play/pause. Наш костыль остаётся для обычного режима
-      и browser fullscreen, где штатный жест может не работать.
+      Кнопка КЮ сначала жмёт штатную кнопку YouTube.
+      Browser fullscreen используется только для контейнера плеера, не для video.
     */
+    hintButtonMode: 'youtube-button-first',
     preserveNativeYoutubeFullscreenGestures: true,
 
     /*
@@ -135,7 +131,6 @@
     fullscreenNeedsGesture: false,
     lastFullscreenAttemptAtMs: 0,
     portraitExitTimerIds: [],
-    autoFullscreenTimerIds: [],
     wasLandscape: false,
 
     lastTap: {
@@ -557,25 +552,13 @@
   function isYoutubeFullscreenActive() {
     try {
       const player = getPlayer();
-
-      if (!player) return false;
-
-      if (
-        player.classList?.contains('ytp-fullscreen') ||
-        player.classList?.contains('fullscreen') ||
-        player.hasAttribute?.('fullscreen')
-      ) {
-        return true;
-      }
-
-      try {
-        if (typeof player.isFullscreen === 'function' && player.isFullscreen()) return true;
-      } catch {}
-
       return Boolean(
-        document.querySelector(
-          '.html5-video-player.ytp-fullscreen, .html5-video-player.fullscreen, ytm-player[fullscreen], ytm-player.fullscreen, .ytp-fullscreen',
-        )
+        player &&
+          (
+            player.classList?.contains('ytp-fullscreen') ||
+            player.classList?.contains('fullscreen') ||
+            document.querySelector('.ytp-fullscreen')
+          )
       );
     } catch {
       return false;
@@ -600,22 +583,19 @@
       '.ytp-fullscreen-button',
       'button.ytp-fullscreen-button',
       'button[aria-label*="Full screen"]',
+      'button[aria-label*="Fullscreen"]',
       'button[aria-label*="fullscreen"]',
       'button[aria-label*="Во весь экран"]',
       'button[aria-label*="полноэкран"]',
       'button[title*="Full screen"]',
-      'button[title*="fullscreen"]',
+      'button[title*="Fullscreen"]',
       'button[title*="Во весь экран"]',
       'button[title*="полноэкран"]',
     ];
 
-    const roots = [getPlayer(), document].filter(Boolean);
-
-    for (const root of roots) {
-      for (const selector of selectors) {
-        const button = root.querySelector?.(selector);
-        if (button) return button;
-      }
+    for (const selector of selectors) {
+      const button = document.querySelector(selector);
+      if (button) return button;
     }
 
     return null;
@@ -626,23 +606,7 @@
       const button = findYoutubeFullscreenButton();
       if (!button) return false;
 
-      /*
-        button.click() обычно достаточно, но на мобильном YouTube иногда важны
-        предварительные pointer/mouse события. Они не делают событие trusted,
-        зато могут разбудить внутреннюю обработку контролов.
-      */
-      try {
-        if (typeof PointerEvent === 'function') {
-          button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'touch' }));
-          button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }));
-        }
-      } catch {}
-
-      try {
-        button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-      } catch {}
-
+      // Только штатный click. Без внутренних API YouTube и без video fullscreen.
       button.click();
       return true;
     } catch {
@@ -650,67 +614,31 @@
     }
   }
 
-  function callYoutubeFullscreenApi(fullscreen) {
-    try {
-      const candidates = [
-        document.querySelector('#movie_player'),
-        document.querySelector('.html5-video-player'),
-        getPlayer(),
-      ].filter(Boolean);
-
-      for (const player of candidates) {
-        try {
-          if (typeof player.isFullscreen === 'function' && player.isFullscreen() === Boolean(fullscreen)) {
-            return true;
-          }
-        } catch {}
-
-        if (typeof player.setFullscreen === 'function') {
-          player.setFullscreen(Boolean(fullscreen));
-          return true;
-        }
-
-        if (fullscreen && typeof player.enterFullscreen === 'function') {
-          player.enterFullscreen();
-          return true;
-        }
-
-        if (!fullscreen && typeof player.exitFullscreen === 'function') {
-          player.exitFullscreen();
-          return true;
-        }
-
-        if (fullscreen && typeof player.toggleFullscreen === 'function' && !isFullscreenActive()) {
-          player.toggleFullscreen();
-          return true;
-        }
-      }
-    } catch {}
-
-    return false;
-  }
-
   function pokeYoutubeControls() {
     if (!CONFIG.pokeControlsBeforeAutoFullscreen) return;
 
     try {
       const player = getPlayer();
-      const video = getVideo();
-      const target = player || video;
+      const target = player || getVideo();
       if (!target) return;
 
-      const rect = target.getBoundingClientRect?.() || { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+      const rect = target.getBoundingClientRect?.() || {
+        left: 0,
+        top: 0,
+        width: window.innerWidth || 1,
+        height: window.innerHeight || 1,
+      };
+
       const x = Math.max(1, Math.floor(rect.left + rect.width / 2));
       const y = Math.max(1, Math.floor(rect.top + rect.height / 2));
 
       try {
-        if (typeof PointerEvent === 'function') {
-          target.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, pointerType: 'touch', clientX: x, clientY: y }));
-        }
-      } catch {}
-
-      try {
-        target.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+        target.dispatchEvent(new MouseEvent('mousemove', {
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y,
+        }));
       } catch {}
     } catch {}
   }
@@ -735,30 +663,30 @@
     return false;
   }
 
-  async function tryBrowserFullscreenFallback(preferVideo = false) {
+  async function tryBrowserFullscreenFallback() {
     if (!CONFIG.allowBrowserFullscreenFallback) return false;
 
-    const video = getVideo();
     const player = getPlayer();
-
-    if (!video) return false;
+    if (!player) return false;
 
     /*
-      Для кнопки КЮ можно предпочесть video: это менее красиво, зато чаще работает
-      на мобильном Chrome.
+      Принципиально не fullscreen-им сам <video>.
+      На Android/Chrome это может дать "голый" нативный fullscreen без оверлеев YouTube:
+      нет play/pause, нет ±10 секунд, зато есть ощущение, что веб-разработку придумали враги.
     */
-    const targets = preferVideo ? [video, player] : [player, video];
+    const targets = [
+      document.querySelector('#movie_player'),
+      document.querySelector('.html5-video-player'),
+      document.querySelector('ytm-player'),
+      player,
+    ].filter(Boolean);
 
-    for (const target of targets) {
+    const uniqueTargets = Array.from(new Set(targets));
+
+    for (const target of uniqueTargets) {
+      if (target === getVideo() && !CONFIG.allowVideoElementFullscreenFallback) continue;
       if (await requestBrowserFullscreen(target)) return true;
     }
-
-    try {
-      if (video.webkitEnterFullscreen) {
-        video.webkitEnterFullscreen();
-        return true;
-      }
-    } catch {}
 
     return false;
   }
@@ -784,50 +712,56 @@
     const isHint = /hint/i.test(reason || '');
     const now = Date.now();
 
-    if (!gesture && now - state.lastFullscreenAttemptAtMs < 120) return false;
+    if (!gesture && now - state.lastFullscreenAttemptAtMs < 80) return false;
     state.lastFullscreenAttemptAtMs = now;
 
     log('try fullscreen', reason);
 
     /*
-      Кнопка КЮ работает по настоящему пользовательскому тапу, поэтому сначала
-      browser fullscreen. Это не трогаем: ты уже подтвердил, что кнопки работают.
+      Кнопка КЮ нажата живым пальцем, поэтому сначала пробуем штатный fullscreen YouTube.
+      Если YouTube опять изображает мебель, используем browser fullscreen только на контейнер
+      плеера, но не на <video>.
     */
-    if (isHint && CONFIG.hintButtonMode === 'browser-first') {
-      if (await tryBrowserFullscreenFallback(true)) {
-        state.fullscreenNeedsGesture = false;
-        hideFullscreenHint();
-        return true;
-      }
+    if (isHint) {
+      pokeYoutubeControls();
 
-      if (callYoutubeFullscreenApi(true) || clickYoutubeFullscreenButton()) {
+      if (clickYoutubeFullscreenButton()) {
         setTimeout(() => {
           if (isFullscreenActive()) {
             state.fullscreenNeedsGesture = false;
             hideFullscreenHint();
-          } else if (isLandscape()) {
-            state.fullscreenNeedsGesture = true;
-            showFullscreenHint();
           }
         }, 350);
 
         return true;
       }
 
+      if (await tryBrowserFullscreenFallback()) {
+        state.fullscreenNeedsGesture = false;
+        hideFullscreenHint();
+        return true;
+      }
+
       state.fullscreenNeedsGesture = true;
       showFullscreenHint();
       return false;
     }
 
     /*
-      Авто-fullscreen при повороте: сначала внутренний API YouTube, потом штатная
-      кнопка. Browser fullscreen без тапа Chrome часто запрещает, поэтому для
-      автоматического сценария используем его только как последнюю попытку.
+      Авто-fullscreen при повороте.
+      Здесь запрещены:
+      - внутренние методы YouTube setFullscreen/enterFullscreen/toggleFullscreen;
+      - requestFullscreen(video);
+      - webkitEnterFullscreen(video).
+
+      Именно они дают тот самый "fullscreen без интерфейса". Поэтому авто-режим только
+      будит контролы и жмёт штатную кнопку YouTube. Если Chrome не разрешил, показываем
+      кнопку КЮ для настоящего пользовательского тапа.
     */
-    if (CONFIG.fullscreenMode === 'youtube-first') {
+    if (CONFIG.fullscreenMode === 'youtube-button-only') {
       pokeYoutubeControls();
 
-      if (callYoutubeFullscreenApi(true) || clickYoutubeFullscreenButton()) {
+      if (clickYoutubeFullscreenButton()) {
         setTimeout(() => {
           if (isFullscreenActive()) {
             state.fullscreenNeedsGesture = false;
@@ -836,22 +770,10 @@
             state.fullscreenNeedsGesture = true;
             showFullscreenHint();
           }
-        }, 420);
+        }, 450);
 
         return true;
       }
-    }
-
-    if (!gesture) {
-      state.fullscreenNeedsGesture = true;
-      showFullscreenHint();
-      return false;
-    }
-
-    if (await tryBrowserFullscreenFallback()) {
-      state.fullscreenNeedsGesture = false;
-      hideFullscreenHint();
-      return true;
     }
 
     state.fullscreenNeedsGesture = true;
@@ -865,15 +787,6 @@
         clearTimeout(timerId);
       }
       state.portraitExitTimerIds = [];
-    } catch {}
-  }
-
-  function clearAutoFullscreenTimers() {
-    try {
-      for (const timerId of state.autoFullscreenTimerIds) {
-        clearTimeout(timerId);
-      }
-      state.autoFullscreenTimerIds = [];
     } catch {}
   }
 
@@ -942,7 +855,6 @@
     let done = false;
 
     if (await exitBrowserFullscreen()) done = true;
-    if (callYoutubeFullscreenApi(false)) done = true;
 
     if (!isLandscape() && exitYoutubePseudoFullscreen()) {
       done = true;
@@ -981,8 +893,6 @@
       return;
     }
 
-    clearAutoFullscreenTimers();
-
     /*
       Выходим из fullscreen только если до этого реально были в горизонтальном режиме
       или fullscreen уже явно активен. Не душим ручное нажатие штатной кнопки в портрете.
@@ -995,16 +905,12 @@
   }
 
   function syncFullscreenSoon(reason = 'soon') {
-    clearAutoFullscreenTimers();
+    const delays = Array.isArray(CONFIG.autoFullscreenAttemptDelaysMs)
+      ? CONFIG.autoFullscreenAttemptDelaysMs
+      : [250, 900];
 
-    for (const delay of CONFIG.autoFullscreenRetryMs) {
-      const timerId = setTimeout(() => {
-        if (isLandscape()) {
-          syncFullscreen(`${reason}:${delay}`);
-        }
-      }, delay);
-
-      state.autoFullscreenTimerIds.push(timerId);
+    for (const delay of delays) {
+      setTimeout(() => syncFullscreen(`${reason}:${delay}`), delay);
     }
   }
 
@@ -1153,7 +1059,11 @@
     const video = getVideo();
     if (!video) return false;
 
-    if (CONFIG.preserveNativeYoutubeFullscreenGestures && isYoutubeFullscreenActive()) {
+    /*
+      В fullscreen не перехватываем жесты: пусть YouTube показывает свои родные
+      play/pause и ±10 секунд. Наш костыль не должен отбирать у пациента вторую ногу.
+    */
+    if (CONFIG.preserveNativeYoutubeFullscreenGestures && isFullscreenActive()) {
       return false;
     }
 
@@ -1266,8 +1176,6 @@
         return;
       }
 
-      clearAutoFullscreenTimers();
-
       /*
         В портретном режиме выходим только если до этого реально были в landscape
         или fullscreen явно активен.
@@ -1281,14 +1189,6 @@
 
     window.addEventListener('orientationchange', () => onOrientationLikeChange('orientationchange'), { passive: true });
     window.addEventListener('resize', () => onOrientationLikeChange('resize'), { passive: true });
-
-    try {
-      if (window.visualViewport) {
-        window.visualViewport.addEventListener('resize', () => onOrientationLikeChange('visualViewport-resize'), {
-          passive: true,
-        });
-      }
-    } catch {}
 
     try {
       if (screen.orientation && typeof screen.orientation.addEventListener === 'function') {
@@ -1370,19 +1270,22 @@
 
     return {
       app: APP_SHORT,
-      version: '0.1.7',
+      version: '0.1.8',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
       browserFullscreen: isBrowserFullscreenActive(),
       youtubeFullscreen: isYoutubePlayerFullscreenClassActive(),
       fullscreenActive: isFullscreenActive(),
-      hasAutoFullscreenTimers: state.autoFullscreenTimerIds.length,
       hasVideo: Boolean(video),
       hasPlayer: Boolean(player),
       hasYoutubeFullscreenButton: Boolean(findYoutubeFullscreenButton()),
       fullscreenNeedsGesture: state.fullscreenNeedsGesture,
       wasLandscape: state.wasLandscape,
+      fullscreenMode: CONFIG.fullscreenMode,
+      nativeGesturesPreserved: CONFIG.preserveNativeYoutubeFullscreenGestures,
+      hasFullscreenButton: Boolean(findYoutubeFullscreenButton()),
+      fullscreenElementTag: (document.fullscreenElement && document.fullscreenElement.tagName) || '',
       segments: state.segments.length,
       loadedVideoId: state.loadedVideoId,
     };
