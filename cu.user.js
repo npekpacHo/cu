@@ -4,7 +4,7 @@
 // @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, exit fullscreen on portrait rotation and double tap ±10s for YouTube mobile web
 // @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, выход из fullscreen при повороте в портрет и двойной тап ±10 секунд для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.1.9
+// @version      0.2.0
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -86,7 +86,9 @@
     allowBrowserFullscreenFallback: true,
 
     /*
-      Кнопка КЮ использует browser fullscreen напрямую.
+      Кнопка КЮ использует browser fullscreen напрямую (на контейнере плеера,
+      не на <video> — см. tryBrowserFullscreenFallback и
+      injectFullscreenScalingFix, 0.2.0).
       Это нужно, чтобы она не зависела от штатной кнопки YouTube.
       Автоматический вход при повороте всё ещё сначала пробует кнопку YouTube.
     */
@@ -637,15 +639,28 @@
     if (!video) return false;
 
     /*
-      Для кнопки КЮ можно предпочесть video: это менее красиво, зато чаще работает
-      на мобильном Chrome.
+      0.2.0: раньше preferVideo=true отправлял в fullscreen сам <video>,
+      что на некоторых сборках Chrome/Xiaomi лечило чёрную полосу слева —
+      но заодно ломало кнопки управления YouTube, потому что .ytp-chrome-bottom
+      и .ytp-chrome-top не являются потомками <video> и не попадают в
+      fullscreen-поддерево вообще.
+
+      Теперь всегда фуллскрин контейнера плеера (в нём остаются все кнопки),
+      а неправильный скейлинг видео чиним отдельно через CSS в
+      applyFullscreenScalingFix(). preferVideo оставлен только как параметр
+      совместимости и на реальный порядок целей больше не влияет.
     */
-    const targets = preferVideo ? [video, player] : [player, video];
+    const targets = [player, video];
 
     for (const target of targets) {
       if (await requestBrowserFullscreen(target)) return true;
     }
 
+    /*
+      Последний резерв: нативный fullscreen video (webkitEnterFullscreen).
+      Он тоже прячет кнопки YouTube, поэтому используется только если
+      fullscreen контейнера в принципе недоступен.
+    */
     try {
       if (video.webkitEnterFullscreen) {
         video.webkitEnterFullscreen();
@@ -1139,6 +1154,56 @@
     );
   }
 
+  /*
+    0.2.0: CSS-фикс скейлинга видео в fullscreen контейнера плеера.
+
+    Раньше чёрная полоса слева на Xiaomi лечилась тем, что в fullscreen уходил
+    сам <video> (нативный скейлинг браузера), но это прятало кнопки YouTube.
+    Теперь фуллскрин всегда на контейнере, а видео внутри принудительно
+    растягивается на 100% с object-fit: contain — это тот же эффект
+    (видео целиком видно, без обрезки), но без потери кнопок, потому что
+    сами кнопки — часть того же контейнера и просто лежат поверх (z-index
+    у YouTube уже настроен правильно, мы его не трогаем).
+  */
+  function injectFullscreenScalingFix() {
+    try {
+      if (document.getElementById(`${APP_ID}-fs-scaling-fix`)) return;
+      if (!document.head && !document.documentElement) return;
+
+      const style = document.createElement('style');
+      style.id = `${APP_ID}-fs-scaling-fix`;
+      style.textContent = `
+        :fullscreen #movie_player,
+        :fullscreen .html5-video-player,
+        :-webkit-full-screen #movie_player,
+        :-webkit-full-screen .html5-video-player {
+          width: 100vw !important;
+          height: 100vh !important;
+          max-width: 100vw !important;
+          max-height: 100vh !important;
+          left: 0 !important;
+          top: 0 !important;
+        }
+
+        :fullscreen #movie_player video.html5-main-video,
+        :fullscreen .html5-video-player video.html5-main-video,
+        :-webkit-full-screen #movie_player video.html5-main-video,
+        :-webkit-full-screen .html5-video-player video.html5-main-video {
+          width: 100% !important;
+          height: 100% !important;
+          left: 0 !important;
+          top: 0 !important;
+          object-fit: contain !important;
+        }
+      `;
+
+      (document.head || document.documentElement).appendChild(style);
+      log('fullscreen scaling fix injected');
+    } catch (error) {
+      log('failed to inject fullscreen scaling fix:', error);
+    }
+  }
+
   function installFullscreenWatchers() {
     const onOrientationLikeChange = (reason) => {
       const landscape = isLandscape();
@@ -1243,7 +1308,7 @@
 
     return {
       app: APP_SHORT,
-      version: '0.1.9',
+      version: '0.2.0',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -1267,6 +1332,7 @@
     state.currentUrl = location.href;
     state.wasLandscape = isLandscape();
 
+    injectFullscreenScalingFix();
     installRouteWatchers();
     installFullscreenWatchers();
     installDoubleTapSeek();
