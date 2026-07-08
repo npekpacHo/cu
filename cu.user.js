@@ -1,13 +1,13 @@
 // ==UserScript==
-// @name         Костыли для Ютуба
+// @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @name:en      Crutches for YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), clean fullscreen on rotation and double tap ±10s for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), аккуратный полноэкранный режим при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.1.4
-// @description  КЮ: SponsorBlock-пропуск, аккуратный fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
-// @description:ru КЮ: SponsorBlock-пропуск, аккуратный fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @version      0.1.5
 // @author       npekpacHo
 // @license      MIT
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
 // @homepageURL  https://github.com/npekpacHo/cu
 // @supportURL   https://github.com/npekpacHo/cu/issues
 // @updateURL    https://raw.githubusercontent.com/npekpacHo/cu/main/cu.user.js
@@ -69,15 +69,14 @@
       Это обычно лучше сохраняет мобильные жесты плеера.
 
       Браузерный requestFullscreen используется только запасным вариантом.
-      Именно он на некоторых телефонах превращает плеер в чёрную полосу с видео, задумчиво
-      приклеенным к правому краю. Веб-разработка, как археология, только грязи больше.
+      Именно он на некоторых телефонах превращает плеер в чёрную полосу с видео, приклеенным к правому краю.
     */
     fullscreenMode: 'youtube-first',
     allowBrowserFullscreenFallback: true,
 
     /*
       Кнопка КЮ использует browser fullscreen напрямую.
-      Это нужно, чтобы она не зависела от капризов штатной кнопки YouTube.
+      Это нужно, чтобы она не зависела от штатной кнопки YouTube.
       Автоматический вход при повороте всё ещё сначала пробует кнопку YouTube.
     */
     hintButtonMode: 'browser-first',
@@ -628,7 +627,7 @@
 
     /*
       Для кнопки КЮ можно предпочесть video: это менее красиво, зато чаще работает
-      на мобильном Chrome. Да, дошли до уровня "менее красиво, зато живое".
+      на мобильном Chrome.
     */
     const targets = preferVideo ? [video, player] : [player, video];
 
@@ -670,9 +669,6 @@
 
     /*
       Не душим реальные пользовательские нажатия таймером.
-      В 0.1.3 это могло мешать кнопке КЮ, потому что сначала прилетала попытка от
-      ориентации, а потом живой человек нажимал кнопку. Человек, конечно, спорное
-      устройство ввода, но иногда он прав.
     */
     if (!gesture && now - state.lastFullscreenAttemptAtMs < 450) return false;
     state.lastFullscreenAttemptAtMs = now;
@@ -795,8 +791,7 @@
   function exitYoutubePseudoFullscreen() {
     /*
       Жмём штатную кнопку YouTube только если плеер явно в fullscreen-классе.
-      Не ищем кнопку "выйти" по всем aria-label на странице: в 0.1.2 эта
-      самодеятельность могла немедленно отменять нормальный вход в fullscreen.
+      Не ищем кнопку "выйти" по всем aria-label на странице.
     */
     try {
       if (!isYoutubePlayerFullscreenClassActive()) return false;
@@ -859,8 +854,7 @@
     }
 
     /*
-      Главное отличие от 0.1.2:
-      выходим из fullscreen только если до этого реально были в горизонтальном режиме
+      Выходим из fullscreen только если до этого реально были в горизонтальном режиме
       или fullscreen уже явно активен. Не душим ручное нажатие штатной кнопки в портрете.
     */
     if (state.wasLandscape || isBrowserFullscreenActive() || isYoutubePlayerFullscreenClassActive()) {
@@ -885,7 +879,7 @@
       const button = document.createElement('button');
       button.id = `${APP_ID}-fullscreen-hint`;
       button.type = 'button';
-      button.textContent = '⛶ КЮ fullscreen';
+      button.textContent = '⛶ На весь экран';
 
       Object.assign(button.style, {
         position: 'fixed',
@@ -1057,8 +1051,7 @@
     const seconds = side === 'left' ? -CONFIG.doubleTapSeekSeconds : CONFIG.doubleTapSeekSeconds;
 
     /*
-      На втором тапе гасим событие, чтобы штатный YouTube не добавил ещё ±10 секунд сверху,
-      если он внезапно очнулся. Да, приходится спасать YouTube от YouTube.
+      На втором тапе гасим событие, чтобы штатный YouTube не добавил ещё ±10 секунд сверху.
     */
     try {
       event.preventDefault();
@@ -1101,8 +1094,6 @@
       (event) => {
         /*
           На браузерах с PointerEvent touchend придёт следом за pointerup.
-          Второй обработчик нам не нужен, иначе получится двойная бухгалтерия
-          имени "почему оно прыгнуло на 20 секунд".
         */
         if (Date.now() - state.lastPointerTapAtMs < 450) return;
         if (!event.changedTouches || event.changedTouches.length !== 1) return;
@@ -1134,8 +1125,7 @@
 
       /*
         В портретном режиме выходим только если до этого реально были в landscape
-        или fullscreen явно активен. И больше никаких глобальных "поймаю любой тап
-        и сам нажму fullscreen", потому что именно так рождаются баги с двойным toggle.
+        или fullscreen явно активен.
       */
       if (state.wasLandscape || isBrowserFullscreenActive() || isYoutubePlayerFullscreenClassActive()) {
         schedulePortraitExit(reason);
