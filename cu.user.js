@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, custom player controls and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, свои кнопки плеера и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, dimmed custom player controls, fullscreen layout fix and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, свои полупрозрачные кнопки плеера, правка fullscreen-разметки и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.4
+// @version      0.2.5
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -108,6 +108,9 @@
     customControlsShowInFullscreen: true,
     customControlsAlwaysVisible: true,
     customControlsAutoHideMs: 3500,
+    customControlsDimAfterMs: 2200,
+    customControlsBrightOpacity: 0.78,
+    customControlsDimOpacity: 0.28,
     customControlsSeekSeconds: 10,
 
     /*
@@ -116,6 +119,14 @@
     */
     preferPlayerContainerFullscreen: true,
     allowVideoElementFullscreenFallback: false,
+
+    /*
+      Эксперимент 0.2.5 против чёрной полосы слева.
+      Раз уж fullscreen контейнера даёт нам кнопки, но иногда криво масштабирует видео,
+      пробуем насильно привести fullscreen-контейнер и video к viewport 100vw × 100vh.
+    */
+    fullscreenLayoutFixEnabled: true,
+    fullscreenLayoutFixRetriesMs: [0, 80, 180, 360, 700, 1200],
 
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
@@ -146,6 +157,8 @@
     fsHintEl: null,
     customControlsEl: null,
     customControlsHideTimer: 0,
+    fullscreenLayoutFixRoot: null,
+    fullscreenLayoutFixTimerIds: [],
     observer: null,
 
     fullscreenNeedsGesture: false,
@@ -638,6 +651,7 @@
     try {
       if (target.requestFullscreen) {
         await target.requestFullscreen({ navigationUI: 'hide' });
+        scheduleFullscreenLayoutFix('requestFullscreen');
         return true;
       }
     } catch {}
@@ -645,6 +659,7 @@
     try {
       if (target.webkitRequestFullscreen) {
         target.webkitRequestFullscreen();
+        scheduleFullscreenLayoutFix('webkitRequestFullscreen');
         return true;
       }
     } catch {}
@@ -740,6 +755,7 @@
       if (await tryBrowserFullscreenFallback(false)) {
         state.fullscreenNeedsGesture = false;
         hideFullscreenHint();
+        scheduleFullscreenLayoutFix('fullscreen-button');
         showCustomControls('fullscreen-button');
         return true;
       }
@@ -749,6 +765,7 @@
           if (isFullscreenActive()) {
             state.fullscreenNeedsGesture = false;
             hideFullscreenHint();
+            scheduleFullscreenLayoutFix('youtube-fullscreen-button');
             showCustomControls('youtube-fullscreen-button');
           } else if (isLandscape()) {
             state.fullscreenNeedsGesture = true;
@@ -870,6 +887,7 @@
 
     state.fullscreenNeedsGesture = false;
     hideFullscreenHint();
+    removeFullscreenLayoutFix();
 
     let done = false;
 
@@ -916,6 +934,7 @@
       */
       if (isFullscreenActive()) {
         hideFullscreenHint();
+        scheduleFullscreenLayoutFix(reason);
         syncCustomControls(reason);
       } else {
         hideCustomControls();
@@ -932,6 +951,7 @@
 
     hideFullscreenHint();
     hideCustomControls();
+    removeFullscreenLayoutFix();
 
     /*
       Выходим из fullscreen только если до этого реально были в горизонтальном режиме
@@ -1004,6 +1024,185 @@
   }
 
 
+
+  function ensureFullscreenLayoutFixStyle() {
+    if (document.getElementById(`${APP_ID}-fullscreen-layout-style`)) return;
+
+    try {
+      const style = document.createElement('style');
+      style.id = `${APP_ID}-fullscreen-layout-style`;
+      style.textContent = `
+html.${APP_ID}-fs-active,
+html.${APP_ID}-fs-active body {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  overflow: hidden !important;
+  background: #000 !important;
+}
+
+[data-${APP_ID}-fs-root="1"] {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  max-height: none !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  left: 0 !important;
+  top: 0 !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: none !important;
+  translate: none !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+  background: #000 !important;
+}
+
+[data-${APP_ID}-fs-root="1"] #movie_player,
+[data-${APP_ID}-fs-root="1"] .html5-video-player,
+[data-${APP_ID}-fs-root="1"] ytm-player,
+[data-${APP_ID}-fs-root="1"] .player-container,
+[data-${APP_ID}-fs-root="1"] .player-container-id {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  max-height: none !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  left: 0 !important;
+  top: 0 !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: none !important;
+  translate: none !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+  background: #000 !important;
+}
+
+[data-${APP_ID}-fs-root="1"] video,
+[data-${APP_ID}-fs-root="1"] video.html5-main-video {
+  position: fixed !important;
+  inset: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  max-height: none !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  object-fit: contain !important;
+  transform: none !important;
+  translate: none !important;
+  background: #000 !important;
+  z-index: 2147483600 !important;
+}
+
+#${APP_ID}-custom-controls {
+  z-index: 2147483647 !important;
+}
+      `;
+
+      (document.head || document.documentElement).appendChild(style);
+    } catch {}
+  }
+
+  function getVideoRectInfo() {
+    try {
+      const video = getVideo();
+      if (!video || !video.getBoundingClientRect) return null;
+
+      const rect = video.getBoundingClientRect();
+      return {
+        left: Math.round(rect.left),
+        top: Math.round(rect.top),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        right: Math.round(rect.right),
+        bottom: Math.round(rect.bottom),
+        viewportWidth: Math.round(window.innerWidth || 0),
+        viewportHeight: Math.round(window.innerHeight || 0),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function clearFullscreenLayoutFixTimers() {
+    try {
+      for (const timerId of state.fullscreenLayoutFixTimerIds) {
+        clearTimeout(timerId);
+      }
+      state.fullscreenLayoutFixTimerIds = [];
+    } catch {}
+  }
+
+  function removeFullscreenLayoutFix() {
+    try {
+      clearFullscreenLayoutFixTimers();
+      document.documentElement.classList.remove(`${APP_ID}-fs-active`);
+
+      if (state.fullscreenLayoutFixRoot) {
+        state.fullscreenLayoutFixRoot.removeAttribute(`data-${APP_ID}-fs-root`);
+        state.fullscreenLayoutFixRoot = null;
+      }
+    } catch {}
+  }
+
+  function applyFullscreenLayoutFix(reason = 'fix') {
+    if (!CONFIG.fullscreenLayoutFixEnabled) return;
+    if (!isLandscape()) return;
+
+    try {
+      ensureFullscreenLayoutFixStyle();
+
+      const fsElement = getFullscreenElement();
+      const player = getPlayer();
+      const root =
+        (fsElement && fsElement.tagName && fsElement.tagName.toLowerCase() !== 'video' && fsElement) ||
+        document.querySelector('#movie_player') ||
+        document.querySelector('.html5-video-player') ||
+        document.querySelector('ytm-player') ||
+        player;
+
+      if (!root) return;
+
+      if (state.fullscreenLayoutFixRoot && state.fullscreenLayoutFixRoot !== root) {
+        state.fullscreenLayoutFixRoot.removeAttribute(`data-${APP_ID}-fs-root`);
+      }
+
+      state.fullscreenLayoutFixRoot = root;
+      root.setAttribute(`data-${APP_ID}-fs-root`, '1');
+      document.documentElement.classList.add(`${APP_ID}-fs-active`);
+
+      log('fullscreen layout fix', reason, getVideoRectInfo());
+    } catch {}
+  }
+
+  function scheduleFullscreenLayoutFix(reason = 'schedule') {
+    if (!CONFIG.fullscreenLayoutFixEnabled) return;
+
+    clearFullscreenLayoutFixTimers();
+
+    for (const delay of CONFIG.fullscreenLayoutFixRetriesMs) {
+      const timerId = setTimeout(() => {
+        if (isLandscape() && isFullscreenActive()) {
+          applyFullscreenLayoutFix(`${reason}:${delay}`);
+          syncCustomControls(`layout-fix:${delay}`);
+        }
+      }, delay);
+
+      state.fullscreenLayoutFixTimerIds.push(timerId);
+    }
+  }
+
   function getFullscreenElement() {
     return (
       document.fullscreenElement ||
@@ -1055,18 +1254,18 @@
     button.className = `${APP_ID}-control-button ${extraClass}`.trim();
 
     Object.assign(button.style, {
-      minWidth: extraClass.includes('play') ? '64px' : '58px',
-      height: '48px',
-      padding: '0 12px',
-      border: '0',
-      borderRadius: '16px',
-      background: 'rgba(0, 0, 0, 0.72)',
-      color: '#fff',
+      minWidth: extraClass.includes('play') ? '60px' : '54px',
+      height: '44px',
+      padding: '0 11px',
+      border: '1px solid rgba(255, 255, 255, 0.12)',
+      borderRadius: '15px',
+      background: 'rgba(0, 0, 0, 0.42)',
+      color: 'rgba(255, 255, 255, 0.9)',
       font: extraClass.includes('play')
-        ? '22px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif'
-        : '17px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
-      fontWeight: '700',
-      boxShadow: '0 4px 18px rgba(0,0,0,.35)',
+        ? '21px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif'
+        : '16px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      fontWeight: '650',
+      boxShadow: '0 3px 14px rgba(0,0,0,.24)',
       pointerEvents: 'auto',
       touchAction: 'manipulation',
       userSelect: 'none',
@@ -1080,8 +1279,8 @@
         event.stopPropagation();
         if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
 
+        brightenCustomControls('button');
         handler();
-        showCustomControls('button');
       },
       true,
     );
@@ -1122,12 +1321,12 @@
         display: 'none',
         alignItems: 'center',
         justifyContent: 'center',
-        gap: '10px',
-        padding: '8px',
-        borderRadius: '22px',
-        background: 'rgba(0, 0, 0, 0.18)',
-        backdropFilter: 'blur(3px)',
-        WebkitBackdropFilter: 'blur(3px)',
+        gap: '9px',
+        padding: '7px',
+        borderRadius: '21px',
+        background: 'rgba(0, 0, 0, 0.08)',
+        backdropFilter: 'blur(2px)',
+        WebkitBackdropFilter: 'blur(2px)',
         pointerEvents: 'none',
       });
 
@@ -1165,6 +1364,36 @@
     return state.customControlsEl;
   }
 
+  function setCustomControlsOpacity(value) {
+    try {
+      if (!state.customControlsEl) return;
+      state.customControlsEl.style.opacity = String(value);
+    } catch {}
+  }
+
+  function dimCustomControls(reason = 'dim') {
+    if (!state.customControlsEl) return;
+    if (!shouldShowCustomControls()) return;
+
+    setCustomControlsOpacity(CONFIG.customControlsDimOpacity);
+    log('dim custom controls', reason);
+  }
+
+  function brightenCustomControls(reason = 'brighten') {
+    if (!state.customControlsEl) return;
+
+    clearTimeout(state.customControlsHideTimer);
+    setCustomControlsOpacity(CONFIG.customControlsBrightOpacity);
+
+    state.customControlsHideTimer = setTimeout(() => {
+      if (CONFIG.customControlsAlwaysVisible) {
+        dimCustomControls(`${reason}:timer`);
+      } else {
+        hideCustomControls();
+      }
+    }, CONFIG.customControlsDimAfterMs);
+  }
+
   function showCustomControls(reason = 'show') {
     if (!shouldShowCustomControls()) {
       hideCustomControls();
@@ -1175,16 +1404,9 @@
     if (!el) return;
 
     el.style.display = 'flex';
-    el.style.opacity = '1';
+    el.style.transition = 'opacity 420ms ease';
     updateCustomControls();
-
-    clearTimeout(state.customControlsHideTimer);
-
-    if (!CONFIG.customControlsAlwaysVisible) {
-      state.customControlsHideTimer = setTimeout(() => {
-        hideCustomControls();
-      }, CONFIG.customControlsAutoHideMs);
-    }
+    brightenCustomControls(reason);
 
     log('show custom controls', reason);
   }
@@ -1449,8 +1671,10 @@
     const onFullscreenLikeChange = () => {
       if (isFullscreenActive()) {
         hideFullscreenHint();
+        scheduleFullscreenLayoutFix('fullscreenchange');
         syncCustomControls('fullscreenchange');
       } else {
+        removeFullscreenLayoutFix();
         hideCustomControls();
 
         if (isLandscape() && CONFIG.showFullscreenHintOnLandscape) {
@@ -1464,6 +1688,15 @@
 
     document.addEventListener('fullscreenchange', onFullscreenLikeChange, true);
     document.addEventListener('webkitfullscreenchange', onFullscreenLikeChange, true);
+
+    const onControlsGesture = (event) => {
+      if (!shouldShowCustomControls()) return;
+      if (isInteractiveTarget(event.target)) return;
+      showCustomControls('gesture');
+    };
+
+    document.addEventListener('pointerup', onControlsGesture, true);
+    document.addEventListener('touchend', onControlsGesture, true);
 
     try {
       if (screen.orientation && typeof screen.orientation.addEventListener === 'function') {
@@ -1546,7 +1779,7 @@
 
     return {
       app: APP_SHORT,
-      version: '0.2.4',
+      version: '0.2.5',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -1561,6 +1794,10 @@
       autoEnterFullscreenOnLandscape: CONFIG.autoEnterFullscreenOnLandscape,
       showFullscreenHintOnLandscape: CONFIG.showFullscreenHintOnLandscape,
       customControlsEnabled: CONFIG.customControlsEnabled,
+      customControlsDimOpacity: CONFIG.customControlsDimOpacity,
+      fullscreenLayoutFixEnabled: CONFIG.fullscreenLayoutFixEnabled,
+      fullscreenLayoutFixRootTag: (state.fullscreenLayoutFixRoot && state.fullscreenLayoutFixRoot.tagName) || '',
+      videoRect: getVideoRectInfo(),
       hasFullscreenHint: Boolean(state.fsHintEl),
       hasCustomControls: Boolean(state.customControlsEl),
       customControlsVisible: Boolean(state.customControlsEl && state.customControlsEl.style.display !== 'none'),
