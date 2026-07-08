@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, dimmed custom player controls, fullscreen layout fix and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, свои полупрозрачные кнопки плеера, правка fullscreen-разметки и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.5
+// @version      0.2.6
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -70,6 +70,15 @@
     autoEnterFullscreenOnLandscape: false,
     showFullscreenHintOnLandscape: true,
 
+    /*
+      0.2.6:
+      кнопку fullscreen показываем только на страницах просмотра /watch.
+      На главной она не нужна: человек ещё не провалился в видео, а мы уже лезем
+      с кнопкой. Такое даже YouTube себе не всегда позволяет.
+    */
+    fullscreenHintWatchPagesOnly: true,
+    fullscreenHintScale: 1.5,
+
     exitFullscreenOnPortrait: true,
 
     /*
@@ -128,6 +137,13 @@
     fullscreenLayoutFixEnabled: true,
     fullscreenLayoutFixRetriesMs: [0, 80, 180, 360, 700, 1200],
 
+    /*
+      Чистка верхних чипов на главной.
+      Оставляем только: Все, Просмотрено, Новое для вас.
+    */
+    homeChipsCleanupEnabled: true,
+    homeChipAllowedLabels: ['все', 'просмотрено', 'новое для вас'],
+
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
     doubleTapMaxDelayMs: 360,
@@ -159,6 +175,7 @@
     customControlsHideTimer: 0,
     fullscreenLayoutFixRoot: null,
     fullscreenLayoutFixTimerIds: [],
+    homeChipsTimer: 0,
     observer: null,
 
     fullscreenNeedsGesture: false,
@@ -216,6 +233,15 @@
 
   function isWatchLikePage() {
     return Boolean(getVideoIdFromUrl());
+  }
+
+  function isHomePage() {
+    try {
+      const path = location.pathname.replace(/\/+$/, '') || '/';
+      return path === '/' || path === '/feed/recommended';
+    } catch {
+      return false;
+    }
   }
 
   function categoryLabel(category) {
@@ -971,10 +997,14 @@
 
   function showFullscreenHint() {
     try {
+      if (CONFIG.fullscreenHintWatchPagesOnly && !isWatchLikePage()) return;
       if (!isLandscape() || state.fsHintEl || isFullscreenActive()) return;
+      if (!getVideo()) return;
 
       const root = getToastRoot();
       if (!root) return;
+
+      const scale = Number(CONFIG.fullscreenHintScale) || 1;
 
       const button = document.createElement('button');
       button.id = `${APP_ID}-fullscreen-hint`;
@@ -983,16 +1013,23 @@
 
       Object.assign(button.style, {
         position: 'fixed',
-        right: '12px',
-        bottom: '12px',
+        right: `${Math.round(12 * scale)}px`,
+        top: '50%',
+        bottom: 'auto',
+        transform: 'translateY(-50%)',
         zIndex: '2147483647',
-        padding: '9px 12px',
+        minHeight: `${Math.round(36 * scale)}px`,
+        padding: `${Math.round(9 * scale)}px ${Math.round(12 * scale)}px`,
         border: '0',
         borderRadius: '999px',
         background: 'rgba(0, 0, 0, 0.78)',
         color: '#fff',
-        font: '13px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+        font: `${Math.round(13 * scale)}px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif`,
+        fontWeight: '700',
+        whiteSpace: 'nowrap',
         boxShadow: '0 3px 18px rgba(0,0,0,.35)',
+        touchAction: 'manipulation',
+        WebkitTapHighlightColor: 'transparent',
       });
 
       button.addEventListener(
@@ -1677,7 +1714,7 @@ html.${APP_ID}-fs-active body {
         removeFullscreenLayoutFix();
         hideCustomControls();
 
-        if (isLandscape() && CONFIG.showFullscreenHintOnLandscape) {
+        if (isLandscape() && CONFIG.showFullscreenHintOnLandscape && (!CONFIG.fullscreenHintWatchPagesOnly || isWatchLikePage())) {
           showFullscreenHint();
         }
       }
@@ -1705,6 +1742,101 @@ html.${APP_ID}-fs-active body {
     } catch {}
   }
 
+
+  function normalizeChipLabel(text) {
+    return String(text || '')
+      .trim()
+      .toLowerCase()
+      .replace(/ё/g, 'е')
+      .replace(/\s+/g, ' ');
+  }
+
+  function getChipLabel(chip) {
+    try {
+      const chipContainer = chip.querySelector?.('.chip-container');
+      const aria =
+        chipContainer?.getAttribute('aria-label') ||
+        chip.getAttribute?.('aria-label') ||
+        '';
+
+      if (aria) return aria;
+
+      return chip.textContent || '';
+    } catch {
+      return '';
+    }
+  }
+
+  function restoreHomeChips() {
+    try {
+      const hiddenItems = document.querySelectorAll('[data-cu-chip-hidden="1"]');
+
+      hiddenItems.forEach((item) => {
+        item.style.removeProperty('display');
+        delete item.dataset.cuChipHidden;
+      });
+    } catch {}
+  }
+
+  function cleanHomeChips(reason = 'clean') {
+    if (!CONFIG.homeChipsCleanupEnabled) return;
+
+    try {
+      const bars = document.querySelectorAll('.chip-bar-contents');
+
+      if (!bars.length) {
+        restoreHomeChips();
+        return;
+      }
+
+      if (!isHomePage()) {
+        restoreHomeChips();
+        return;
+      }
+
+      const allowed = new Set(
+        (CONFIG.homeChipAllowedLabels || []).map((label) => normalizeChipLabel(label)),
+      );
+
+      bars.forEach((bar) => {
+        Array.from(bar.children || []).forEach((item) => {
+          const tag = (item.tagName || '').toLowerCase();
+
+          if (tag === 'ytm-chip-divider-renderer') {
+            item.style.display = 'none';
+            item.dataset.cuChipHidden = '1';
+            return;
+          }
+
+          if (tag !== 'ytm-chip-cloud-chip-renderer') return;
+
+          const label = normalizeChipLabel(getChipLabel(item));
+          const keep = allowed.has(label);
+
+          if (keep) {
+            item.style.removeProperty('display');
+            delete item.dataset.cuChipHidden;
+          } else {
+            item.style.display = 'none';
+            item.dataset.cuChipHidden = '1';
+          }
+        });
+      });
+
+      log('home chips cleaned', reason);
+    } catch (error) {
+      log('home chips cleanup failed:', error);
+    }
+  }
+
+  function scheduleHomeChipsCleanup(reason = 'scheduled') {
+    if (!CONFIG.homeChipsCleanupEnabled) return;
+
+    clearTimeout(state.homeChipsTimer);
+    state.homeChipsTimer = setTimeout(() => cleanHomeChips(reason), 120);
+  }
+
+
   function onUrlMaybeChanged(reason = 'url') {
     const href = location.href;
     if (href === state.currentUrl) return;
@@ -1721,6 +1853,7 @@ html.${APP_ID}-fs-active body {
     scheduleBind();
     scheduleRefresh(reason);
     syncFullscreenSoon(reason);
+    scheduleHomeChipsCleanup(reason);
   }
 
   function installRouteWatchers() {
@@ -1756,6 +1889,7 @@ html.${APP_ID}-fs-active body {
 
       state.observer = new MutationObserver(() => {
         scheduleBind();
+        scheduleHomeChipsCleanup('mutation');
 
         if (location.href !== state.currentUrl) {
           onUrlMaybeChanged('mutation-url');
@@ -1779,7 +1913,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.2.5',
+      version: '0.2.6',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -1797,6 +1931,10 @@ html.${APP_ID}-fs-active body {
       customControlsDimOpacity: CONFIG.customControlsDimOpacity,
       fullscreenLayoutFixEnabled: CONFIG.fullscreenLayoutFixEnabled,
       fullscreenLayoutFixRootTag: (state.fullscreenLayoutFixRoot && state.fullscreenLayoutFixRoot.tagName) || '',
+      fullscreenHintWatchPagesOnly: CONFIG.fullscreenHintWatchPagesOnly,
+      fullscreenHintScale: CONFIG.fullscreenHintScale,
+      homePage: isHomePage(),
+      homeChipsCleanupEnabled: CONFIG.homeChipsCleanupEnabled,
       videoRect: getVideoRectInfo(),
       hasFullscreenHint: Boolean(state.fsHintEl),
       hasCustomControls: Boolean(state.customControlsEl),
@@ -1819,6 +1957,7 @@ html.${APP_ID}-fs-active body {
     scheduleBind();
     scheduleRefresh('init');
     syncFullscreenSoon('init');
+    scheduleHomeChipsCleanup('init');
 
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
@@ -1826,6 +1965,7 @@ html.${APP_ID}-fs-active body {
         scheduleRefresh('visibility');
         syncFullscreenSoon('visibility');
         syncCustomControls('visibility');
+        scheduleHomeChipsCleanup('visibility');
       }
     });
   }
