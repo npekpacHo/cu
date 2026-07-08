@@ -3,10 +3,10 @@
 // @name:ru      Костыли для Ютуба
 // @name:en      Crutches for YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.1.0
-// @description  КЮ: SponsorBlock-пропуск и fullscreen при повороте для мобильной веб-версии YouTube
-// @description:ru КЮ: SponsorBlock-пропуск и fullscreen при повороте для мобильной веб-версии YouTube
-// @author       npekpacHo + ChatGPT
+// @version      0.1.1
+// @description  КЮ: SponsorBlock-пропуск, fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @description:ru КЮ: SponsorBlock-пропуск, fullscreen при повороте и двойной тап ±10 секунд для мобильной веб-версии YouTube
+// @author       npekpacHo
 // @license      MIT
 // @homepageURL  https://github.com/npekpacHo/cu
 // @supportURL   https://github.com/npekpacHo/cu/issues
@@ -25,7 +25,6 @@
 
   const APP_ID = 'cu';
   const APP_SHORT = 'КЮ';
-  const APP_NAME = 'Костыли для Ютуба';
 
   const CONFIG = {
     /*
@@ -62,6 +61,25 @@
     autoFullscreenOnLandscape: true,
     exitFullscreenOnPortrait: true,
 
+    /*
+      Важно для мобильного YouTube.
+
+      youtube-first:
+      сначала жмём штатную кнопку fullscreen самого YouTube.
+      Это обычно лучше сохраняет мобильные жесты плеера.
+
+      Браузерный requestFullscreen используется только запасным вариантом.
+      Именно он на некоторых телефонах превращает плеер в чёрную полосу с видео, задумчиво
+      приклеенным к правому краю. Веб-разработка, как археология, только грязи больше.
+    */
+    fullscreenMode: 'youtube-first',
+    allowBrowserFullscreenFallback: true,
+
+    doubleTapSeekEnabled: true,
+    doubleTapSeekSeconds: 10,
+    doubleTapMaxDelayMs: 360,
+    doubleTapMaxDistancePx: 44,
+
     showToasts: true,
     debug: false,
   };
@@ -85,6 +103,17 @@
 
     fsHintEl: null,
     observer: null,
+
+    fullscreenNeedsGesture: false,
+    lastFullscreenAttemptAtMs: 0,
+
+    lastTap: {
+      time: 0,
+      x: 0,
+      y: 0,
+      side: '',
+    },
+    lastPointerTapAtMs: 0,
   };
 
   const log = (...args) => {
@@ -494,7 +523,23 @@
     return window.innerWidth > window.innerHeight;
   }
 
-  function isFullscreenActive() {
+  function isYoutubeFullscreenActive() {
+    try {
+      const player = getPlayer();
+      return Boolean(
+        player &&
+          (
+            player.classList?.contains('ytp-fullscreen') ||
+            player.classList?.contains('fullscreen') ||
+            document.querySelector('.ytp-fullscreen')
+          )
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function isBrowserFullscreenActive() {
     return Boolean(
       document.fullscreenElement ||
         document.webkitFullscreenElement ||
@@ -503,7 +548,41 @@
     );
   }
 
-  async function requestFullscreen(target) {
+  function isFullscreenActive() {
+    return isBrowserFullscreenActive() || isYoutubeFullscreenActive();
+  }
+
+  function findYoutubeFullscreenButton() {
+    const selectors = [
+      '.ytp-fullscreen-button',
+      'button.ytp-fullscreen-button',
+      'button[aria-label*="Full screen"]',
+      'button[aria-label*="fullscreen"]',
+      'button[aria-label*="Во весь экран"]',
+      'button[aria-label*="полноэкран"]',
+    ];
+
+    for (const selector of selectors) {
+      const button = document.querySelector(selector);
+      if (button) return button;
+    }
+
+    return null;
+  }
+
+  function clickYoutubeFullscreenButton() {
+    try {
+      const button = findYoutubeFullscreenButton();
+      if (!button) return false;
+
+      button.click();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function requestBrowserFullscreen(target) {
     if (!target) return false;
 
     try {
@@ -523,71 +602,89 @@
     return false;
   }
 
-  function clickYoutubeFullscreenButton() {
-    try {
-      const selectors = [
-        '.ytp-fullscreen-button',
-        'button.ytp-fullscreen-button',
-        'button[aria-label*="Full screen"]',
-        'button[aria-label*="fullscreen"]',
-        'button[aria-label*="Во весь экран"]',
-        'button[aria-label*="полноэкран"]',
-      ];
-
-      for (const selector of selectors) {
-        const button = document.querySelector(selector);
-        if (button) {
-          button.click();
-          return true;
-        }
-      }
-    } catch {}
-
-    return false;
-  }
-
-  async function enterFullscreen(reason = 'unknown') {
-    if (!CONFIG.autoFullscreenOnLandscape) return false;
-    if (!isWatchLikePage()) return false;
-    if (!isLandscape()) return false;
-    if (isFullscreenActive()) return true;
+  async function tryBrowserFullscreenFallback() {
+    if (!CONFIG.allowBrowserFullscreenFallback) return false;
 
     const video = getVideo();
     const player = getPlayer();
 
     if (!video) return false;
 
-    log('try fullscreen', reason);
-
-    if (await requestFullscreen(player)) {
-      hideFullscreenHint();
-      return true;
-    }
-
-    if (await requestFullscreen(video)) {
-      hideFullscreenHint();
-      return true;
-    }
+    if (await requestBrowserFullscreen(player)) return true;
+    if (await requestBrowserFullscreen(video)) return true;
 
     try {
       if (video.webkitEnterFullscreen) {
         video.webkitEnterFullscreen();
-        hideFullscreenHint();
         return true;
       }
     } catch {}
 
-    if (clickYoutubeFullscreenButton()) {
+    return false;
+  }
+
+  function isGestureReason(reason) {
+    return /pointer|touch|tap|hint|click/i.test(reason || '');
+  }
+
+  async function enterFullscreen(reason = 'unknown') {
+    if (!CONFIG.autoFullscreenOnLandscape) return false;
+    if (!isWatchLikePage()) return false;
+    if (!isLandscape()) return false;
+    if (isFullscreenActive()) {
+      state.fullscreenNeedsGesture = false;
       hideFullscreenHint();
       return true;
     }
 
+    const video = getVideo();
+    if (!video) return false;
+
+    const now = Date.now();
+    if (now - state.lastFullscreenAttemptAtMs < 450) return false;
+    state.lastFullscreenAttemptAtMs = now;
+
+    log('try fullscreen', reason);
+
+    if (CONFIG.fullscreenMode === 'youtube-first' && clickYoutubeFullscreenButton()) {
+      setTimeout(() => {
+        if (isFullscreenActive()) {
+          state.fullscreenNeedsGesture = false;
+          hideFullscreenHint();
+        }
+      }, 350);
+
+      return true;
+    }
+
+    /*
+      Без жеста пользователя Chrome Android часто запрещает нормальный fullscreen.
+      Поэтому при пассивном событии вроде resize/orientationchange не лезем сразу в
+      браузерный requestFullscreen, а показываем кнопку. Пусть человек один раз ткнёт
+      по экрану, раз уж вся платформа построена на ритуальных прикосновениях.
+    */
+    if (!isGestureReason(reason)) {
+      state.fullscreenNeedsGesture = true;
+      showFullscreenHint();
+      return false;
+    }
+
+    if (await tryBrowserFullscreenFallback()) {
+      state.fullscreenNeedsGesture = false;
+      hideFullscreenHint();
+      return true;
+    }
+
+    state.fullscreenNeedsGesture = true;
     showFullscreenHint();
     return false;
   }
 
   async function exitFullscreen() {
     if (!CONFIG.exitFullscreenOnPortrait) return;
+
+    state.fullscreenNeedsGesture = false;
+    hideFullscreenHint();
 
     try {
       if (document.fullscreenElement && document.exitFullscreen) {
@@ -601,6 +698,16 @@
         document.webkitExitFullscreen();
       }
     } catch {}
+
+    /*
+      Если YouTube держит свой псевдо-fullscreen, пробуем выйти его же кнопкой.
+      Проверяем landscape отдельно, чтобы не устроить toggle туда-сюда.
+    */
+    try {
+      if (!isLandscape() && isYoutubeFullscreenActive()) {
+        clickYoutubeFullscreenButton();
+      }
+    } catch {}
   }
 
   function syncFullscreen(reason = 'sync') {
@@ -609,7 +716,6 @@
     if (isLandscape()) {
       enterFullscreen(reason);
     } else {
-      hideFullscreenHint();
       exitFullscreen();
     }
   }
@@ -650,6 +756,7 @@
         (event) => {
           event.preventDefault();
           event.stopPropagation();
+          state.fullscreenNeedsGesture = true;
           enterFullscreen('hint-button');
         },
         true,
@@ -669,6 +776,225 @@
     } catch {}
   }
 
+  function isInteractiveTarget(target) {
+    try {
+      if (!target || target.nodeType !== 1) return false;
+
+      return Boolean(
+        target.closest(
+          [
+            `#${APP_ID}-fullscreen-hint`,
+            `#${APP_ID}-toast`,
+            'a',
+            'button',
+            'input',
+            'textarea',
+            'select',
+            '[role="button"]',
+            '[contenteditable="true"]',
+            '.ytp-chrome-bottom',
+            '.ytp-chrome-top',
+            '.ytp-settings-menu',
+            '.ytp-popup',
+            '.ytp-panel',
+            'ytm-menu',
+            'ytm-pivot-bar-renderer',
+            'ytm-bottom-sheet-renderer',
+          ].join(','),
+        )
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function getTapArea() {
+    const video = getVideo();
+    const player = getPlayer();
+
+    /*
+      В fullscreen ориентируемся по viewport, а не по getBoundingClientRect().
+      Это важно как раз для случаев, когда видео уехало вправо и слева торчит
+      чёрная полоса. Клик по левой стороне всё равно должен считаться левой стороной.
+    */
+    if (isLandscape() || isFullscreenActive()) {
+      return {
+        left: 0,
+        top: 0,
+        width: Math.max(window.innerWidth || 0, 1),
+        height: Math.max(window.innerHeight || 0, 1),
+      };
+    }
+
+    const rect = (player || video)?.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      return {
+        left: 0,
+        top: 0,
+        width: Math.max(window.innerWidth || 0, 1),
+        height: Math.max(window.innerHeight || 0, 1),
+      };
+    }
+
+    return rect;
+  }
+
+  function isPointInsideArea(x, y, area) {
+    return x >= area.left && x <= area.left + area.width && y >= area.top && y <= area.top + area.height;
+  }
+
+  function seekBy(seconds) {
+    const video = getVideo();
+    if (!video) return false;
+
+    const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
+    const current = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const target = Math.max(0, Math.min(current + seconds, duration));
+
+    try {
+      video.currentTime = target;
+      toast(`${APP_SHORT}: ${seconds > 0 ? '+' : ''}${seconds} секунд`, 700);
+      return true;
+    } catch (error) {
+      log('double tap seek failed:', error);
+      return false;
+    }
+  }
+
+  function handleDoubleTapSeek(event, point, source) {
+    if (!CONFIG.doubleTapSeekEnabled) return false;
+    if (!isWatchLikePage()) return false;
+
+    const video = getVideo();
+    if (!video) return false;
+
+    if (event.defaultPrevented) return false;
+    if (isInteractiveTarget(event.target)) return false;
+
+    const area = getTapArea();
+    const x = Number(point.x);
+    const y = Number(point.y);
+
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    if (!isPointInsideArea(x, y, area)) return false;
+
+    const now = Date.now();
+    const relX = x - area.left;
+    const side = relX < area.width / 2 ? 'left' : 'right';
+
+    const dt = now - state.lastTap.time;
+    const dx = x - state.lastTap.x;
+    const dy = y - state.lastTap.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    const isDouble =
+      state.lastTap.side === side &&
+      dt > 35 &&
+      dt <= CONFIG.doubleTapMaxDelayMs &&
+      dist <= CONFIG.doubleTapMaxDistancePx;
+
+    state.lastTap = {
+      time: now,
+      x,
+      y,
+      side,
+    };
+
+    if (!isDouble) return false;
+
+    const seconds = side === 'left' ? -CONFIG.doubleTapSeekSeconds : CONFIG.doubleTapSeekSeconds;
+
+    /*
+      На втором тапе гасим событие, чтобы штатный YouTube не добавил ещё ±10 секунд сверху,
+      если он внезапно очнулся. Да, приходится спасать YouTube от YouTube.
+    */
+    try {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+    } catch {}
+
+    seekBy(seconds);
+
+    log('double tap seek', { source, side, seconds });
+    return true;
+  }
+
+  function installDoubleTapSeek() {
+    if (!CONFIG.doubleTapSeekEnabled) return;
+
+    if ('PointerEvent' in window) {
+      document.addEventListener(
+        'pointerup',
+        (event) => {
+          if (event.pointerType === 'mouse') return;
+
+          state.lastPointerTapAtMs = Date.now();
+
+          handleDoubleTapSeek(
+            event,
+            {
+              x: event.clientX,
+              y: event.clientY,
+            },
+            'pointerup',
+          );
+        },
+        true,
+      );
+    }
+
+    document.addEventListener(
+      'touchend',
+      (event) => {
+        /*
+          На браузерах с PointerEvent touchend придёт следом за pointerup.
+          Второй обработчик нам не нужен, иначе получится двойная бухгалтерия
+          имени "почему оно прыгнуло на 20 секунд".
+        */
+        if (Date.now() - state.lastPointerTapAtMs < 450) return;
+        if (!event.changedTouches || event.changedTouches.length !== 1) return;
+
+        const touch = event.changedTouches[0];
+
+        handleDoubleTapSeek(
+          event,
+          {
+            x: touch.clientX,
+            y: touch.clientY,
+          },
+          'touchend',
+        );
+      },
+      true,
+    );
+  }
+
+  function installFullscreenWatchers() {
+    window.addEventListener('orientationchange', () => syncFullscreenSoon('orientationchange'), { passive: true });
+    window.addEventListener('resize', () => syncFullscreenSoon('resize'), { passive: true });
+
+    /*
+      Повторяем fullscreen только если предыдущая попытка явно упёрлась в необходимость
+      пользовательского жеста. В версии 0.1.0 мы реагировали почти на каждый тап в landscape,
+      и это могло ломать привычный двойной тап YouTube. Слишком услужливый костыль тоже костыль.
+    */
+    const onUserGesture = () => {
+      if (!state.fullscreenNeedsGesture) return;
+      if (!isLandscape()) return;
+      if (isFullscreenActive()) {
+        state.fullscreenNeedsGesture = false;
+        hideFullscreenHint();
+        return;
+      }
+
+      enterFullscreen('user-gesture');
+    };
+
+    document.addEventListener('pointerup', onUserGesture, true);
+    document.addEventListener('touchend', onUserGesture, true);
+  }
+
   function onUrlMaybeChanged(reason = 'url') {
     const href = location.href;
     if (href === state.currentUrl) return;
@@ -679,6 +1005,7 @@
     state.segments = [];
     state.lastSkipKey = '';
     state.lastSkipAtMs = 0;
+    state.lastTap.time = 0;
 
     scheduleBind();
     scheduleRefresh(reason);
@@ -712,32 +1039,6 @@
     } catch {}
   }
 
-  function installFullscreenWatchers() {
-    window.addEventListener('orientationchange', () => syncFullscreenSoon('orientationchange'), { passive: true });
-    window.addEventListener('resize', () => syncFullscreenSoon('resize'), { passive: true });
-
-    /*
-      Chrome Android часто не даёт включить fullscreen без жеста пользователя.
-      Поэтому, если автопереход при повороте был послан лесом, ближайший тап в landscape
-      повторит попытку уже с пользовательской активацией. Прогресс, как он есть.
-    */
-    document.addEventListener(
-      'pointerup',
-      () => {
-        if (isLandscape()) enterFullscreen('pointerup');
-      },
-      true,
-    );
-
-    document.addEventListener(
-      'touchend',
-      () => {
-        if (isLandscape()) enterFullscreen('touchend');
-      },
-      true,
-    );
-  }
-
   function installMutationObserver() {
     try {
       if (!document.documentElement) return;
@@ -762,6 +1063,7 @@
 
     installRouteWatchers();
     installFullscreenWatchers();
+    installDoubleTapSeek();
     installMutationObserver();
 
     scheduleBind();
