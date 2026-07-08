@@ -4,7 +4,7 @@
 // @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button, exit fullscreen on portrait rotation and double tap ±10s for YouTube mobile web
 // @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка полноэкранного режима, выход из fullscreen при повороте в портрет и двойной тап ±10 секунд для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.1
+// @version      0.2.2
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -1181,8 +1181,6 @@
           height: 100vh !important;
           max-width: 100vw !important;
           max-height: 100vh !important;
-          left: 0 !important;
-          top: 0 !important;
         }
 
         #movie_player:fullscreen video.html5-main-video,
@@ -1191,8 +1189,6 @@
         .html5-video-player:-webkit-full-screen video.html5-main-video {
           width: 100% !important;
           height: 100% !important;
-          left: 0 !important;
-          top: 0 !important;
           object-fit: contain !important;
         }
       `;
@@ -1310,7 +1306,7 @@
 
     return {
       app: APP_SHORT,
-      version: '0.2.1',
+      version: '0.2.2',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
