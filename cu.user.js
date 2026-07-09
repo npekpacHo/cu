@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, styled remembered volume slider, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, стилизованный запоминаемый ползунок громкости, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.8
+// @version      0.2.9
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -136,10 +136,10 @@
     volumeSliderWidthPx: 126,
 
     /*
-      Визуал ползунка:
-      слева от бегунка активная часть толще, справа неактивная часть тоньше.
-      Почему это не стандартное поведение input[type=range] везде одинаково?
-      Потому что веб, сынок.
+      0.2.9:
+      кастомная отрисовка дорожки громкости вместо CSS-псевдоэлементов range.
+      На мобильном Chrome псевдоэлементы иногда исчезают, оставляя один бегунок,
+      потому что стандарты веба писали люди, которым явно было мало боли.
     */
     volumeTrackHeightActivePx: 6,
     volumeTrackHeightInactivePx: 2,
@@ -202,6 +202,9 @@
     customControlsHideTimer: 0,
     volumeAppliedVideo: null,
     volumeSliderEl: null,
+    volumeTrackEl: null,
+    volumeActiveTrackEl: null,
+    volumeThumbEl: null,
     volumeLabelEl: null,
     fullscreenLayoutFixRoot: null,
     fullscreenLayoutFixTimerIds: [],
@@ -1417,6 +1420,25 @@ html.${APP_ID}-fs-active body {
     }
   }
 
+  function updateVolumeSliderVisual(value = null) {
+    const slider = state.volumeSliderEl;
+    const activeTrack = state.volumeActiveTrackEl;
+    const thumb = state.volumeThumbEl;
+
+    if (!slider || !activeTrack || !thumb) return;
+
+    try {
+      const min = Number(slider.min || CONFIG.volumeMinPercent);
+      const max = Number(slider.max || CONFIG.volumeMaxPercent);
+      const raw = value === null ? Number(slider.value || 0) : Number(value);
+      const percent = max > min ? ((raw - min) / (max - min)) * 100 : 0;
+      const clamped = clampNumber(percent, 0, 100);
+
+      activeTrack.style.width = `${clamped}%`;
+      thumb.style.left = `${clamped}%`;
+    } catch {}
+  }
+
   function updateVolumeControl() {
     if (!CONFIG.volumeControlEnabled) return;
 
@@ -1430,111 +1452,11 @@ html.${APP_ID}-fs-active body {
 
     try {
       slider.value = String(percent);
-      updateVolumeSliderFill(slider);
+      updateVolumeSliderVisual(percent);
       label.textContent = `${percent}%`;
       label.title = `Громкость ${percent}%`;
     } catch {}
   }
-
-
-  function ensureVolumeSliderStyle() {
-    if (!CONFIG.volumeControlEnabled) return;
-
-    try {
-      const styleId = `${APP_ID}-volume-slider-style`;
-      let style = document.getElementById(styleId);
-
-      if (!style) {
-        style = document.createElement('style');
-        style.id = styleId;
-        (document.head || document.documentElement).appendChild(style);
-      }
-
-      const activeHeight = `${CONFIG.volumeTrackHeightActivePx}px`;
-      const inactiveHeight = `${CONFIG.volumeTrackHeightInactivePx}px`;
-      const thumbSize = `${CONFIG.volumeThumbSizePx}px`;
-
-      /*
-        Разный "толстый слева / тонкий справа" делаем не двумя настоящими дорожками,
-        а layered CSS:
-        - сам range получает тонкую базовую дорожку;
-        - активная часть рисуется background-gradient'ом на самом input;
-        - thumb остаётся поверх.
-      */
-      style.textContent = `
-        input.${APP_ID}-volume-slider {
-          --cu-volume-percent: 30%;
-          appearance: none;
-          -webkit-appearance: none;
-          height: ${thumbSize};
-          border: 0;
-          padding: 0;
-          margin: 0;
-          outline: none;
-          background:
-            linear-gradient(${CONFIG.volumeTrackColorActive}, ${CONFIG.volumeTrackColorActive})
-              left 50% / var(--cu-volume-percent) ${activeHeight} no-repeat,
-            linear-gradient(${CONFIG.volumeTrackColorInactive}, ${CONFIG.volumeTrackColorInactive})
-              left 50% / 100% ${inactiveHeight} no-repeat;
-        }
-
-        input.${APP_ID}-volume-slider::-webkit-slider-runnable-track {
-          height: ${thumbSize};
-          background: transparent;
-          border: 0;
-        }
-
-        input.${APP_ID}-volume-slider::-webkit-slider-thumb {
-          -webkit-appearance: none;
-          appearance: none;
-          width: ${thumbSize};
-          height: ${thumbSize};
-          margin-top: 0;
-          border-radius: 999px;
-          border: 2px solid rgba(255, 255, 255, 0.92);
-          background: rgba(255, 255, 255, 0.92);
-          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.40);
-        }
-
-        input.${APP_ID}-volume-slider::-moz-range-track {
-          height: ${CONFIG.volumeTrackHeightInactivePx}px;
-          background: ${CONFIG.volumeTrackColorInactive};
-          border: 0;
-          border-radius: 999px;
-        }
-
-        input.${APP_ID}-volume-slider::-moz-range-progress {
-          height: ${CONFIG.volumeTrackHeightActivePx}px;
-          background: ${CONFIG.volumeTrackColorActive};
-          border: 0;
-          border-radius: 999px;
-        }
-
-        input.${APP_ID}-volume-slider::-moz-range-thumb {
-          width: ${thumbSize};
-          height: ${thumbSize};
-          border-radius: 999px;
-          border: 2px solid rgba(255, 255, 255, 0.92);
-          background: rgba(255, 255, 255, 0.92);
-          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.40);
-        }
-      `;
-    } catch {}
-  }
-
-  function updateVolumeSliderFill(slider = state.volumeSliderEl) {
-    if (!slider) return;
-
-    try {
-      const min = Number(slider.min || CONFIG.volumeMinPercent);
-      const max = Number(slider.max || CONFIG.volumeMaxPercent);
-      const value = Number(slider.value || 0);
-      const percent = max > min ? ((value - min) / (max - min)) * 100 : 0;
-
-      slider.style.setProperty('--cu-volume-percent', `${clampNumber(percent, 0, 100)}%`);
-    } catch {}
-  }
-
 
   function createVolumeControl() {
     const group = document.createElement('div');
@@ -1566,21 +1488,90 @@ html.${APP_ID}-fs-active body {
       opacity: '0.9',
     });
 
-    ensureVolumeSliderStyle();
+    const sliderWrap = document.createElement('div');
+    sliderWrap.className = `${APP_ID}-volume-slider-wrap`;
+
+    Object.assign(sliderWrap.style, {
+      position: 'relative',
+      width: `${CONFIG.volumeSliderWidthPx}px`,
+      maxWidth: '24vw',
+      height: `${Math.max(CONFIG.volumeThumbSizePx, CONFIG.volumeTrackHeightActivePx) + 6}px`,
+      display: 'flex',
+      alignItems: 'center',
+      flex: '0 0 auto',
+      pointerEvents: 'auto',
+      touchAction: 'pan-x',
+    });
+
+    const inactiveTrack = document.createElement('div');
+    inactiveTrack.className = `${APP_ID}-volume-track-inactive`;
+
+    Object.assign(inactiveTrack.style, {
+      position: 'absolute',
+      left: '0',
+      right: '0',
+      top: '50%',
+      height: `${CONFIG.volumeTrackHeightInactivePx}px`,
+      transform: 'translateY(-50%)',
+      borderRadius: '999px',
+      background: CONFIG.volumeTrackColorInactive,
+      pointerEvents: 'none',
+    });
+
+    const activeTrack = document.createElement('div');
+    activeTrack.className = `${APP_ID}-volume-track-active`;
+
+    Object.assign(activeTrack.style, {
+      position: 'absolute',
+      left: '0',
+      top: '50%',
+      width: '30%',
+      height: `${CONFIG.volumeTrackHeightActivePx}px`,
+      transform: 'translateY(-50%)',
+      borderRadius: '999px',
+      background: CONFIG.volumeTrackColorActive,
+      pointerEvents: 'none',
+    });
+
+    const thumb = document.createElement('div');
+    thumb.className = `${APP_ID}-volume-thumb`;
+
+    Object.assign(thumb.style, {
+      position: 'absolute',
+      left: '30%',
+      top: '50%',
+      width: `${CONFIG.volumeThumbSizePx}px`,
+      height: `${CONFIG.volumeThumbSizePx}px`,
+      transform: 'translate(-50%, -50%)',
+      borderRadius: '999px',
+      border: '2px solid rgba(255, 255, 255, 0.92)',
+      background: 'rgba(255, 255, 255, 0.92)',
+      boxShadow: '0 2px 8px rgba(0, 0, 0, 0.40)',
+      pointerEvents: 'none',
+    });
 
     const slider = document.createElement('input');
     slider.type = 'range';
-    slider.className = `${APP_ID}-volume-slider`;
     slider.min = String(CONFIG.volumeMinPercent);
     slider.max = String(CONFIG.volumeMaxPercent);
     slider.step = String(CONFIG.volumeStepPercent);
     slider.value = String(readStoredVolumePercent() ?? CONFIG.volumeDefaultPercent);
     slider.setAttribute('aria-label', 'Громкость');
 
+    /*
+      Нативный range остаётся, но становится прозрачным сенсорным слоем.
+      Дорожку и бегунок рисуем своими div-ами, потому что иначе Chrome снова
+      оставляет один сиротливый кружочек. Забота о пользователе через имитацию UI,
+      вот она, вершина цивилизации.
+    */
     Object.assign(slider.style, {
-      width: `${CONFIG.volumeSliderWidthPx}px`,
-      maxWidth: '24vw',
-      background: 'transparent',
+      position: 'absolute',
+      inset: '0',
+      width: '100%',
+      height: '100%',
+      margin: '0',
+      padding: '0',
+      opacity: '0.001',
       cursor: 'pointer',
       pointerEvents: 'auto',
       touchAction: 'pan-x',
@@ -1606,6 +1597,7 @@ html.${APP_ID}-fs-active body {
 
     ['pointerdown', 'touchstart', 'click'].forEach((name) => {
       group.addEventListener(name, stop, true);
+      sliderWrap.addEventListener(name, stop, true);
       slider.addEventListener(name, stop, true);
     });
 
@@ -1614,7 +1606,7 @@ html.${APP_ID}-fs-active body {
       (event) => {
         event.preventDefault();
         event.stopPropagation();
-        updateVolumeSliderFill(slider);
+        updateVolumeSliderVisual(slider.value);
         setVideoVolumePercent(slider.value, 'slider');
         brightenCustomControls('volume-input');
       },
@@ -1626,20 +1618,29 @@ html.${APP_ID}-fs-active body {
       (event) => {
         event.preventDefault();
         event.stopPropagation();
-        updateVolumeSliderFill(slider);
+        updateVolumeSliderVisual(slider.value);
         setVideoVolumePercent(slider.value, 'slider-change');
         brightenCustomControls('volume-change');
       },
       true,
     );
 
+    sliderWrap.appendChild(inactiveTrack);
+    sliderWrap.appendChild(activeTrack);
+    sliderWrap.appendChild(thumb);
+    sliderWrap.appendChild(slider);
+
     group.appendChild(icon);
-    group.appendChild(slider);
+    group.appendChild(sliderWrap);
     group.appendChild(label);
 
     state.volumeSliderEl = slider;
+    state.volumeTrackEl = inactiveTrack;
+    state.volumeActiveTrackEl = activeTrack;
+    state.volumeThumbEl = thumb;
     state.volumeLabelEl = label;
-    updateVolumeSliderFill(slider);
+
+    updateVolumeSliderVisual(slider.value);
 
     return group;
   }
@@ -2294,7 +2295,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.2.8',
+      version: '0.2.9',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -2314,8 +2315,8 @@ html.${APP_ID}-fs-active body {
       volumePercent: getVideoVolumePercent(video),
       storedVolumePercent: readStoredVolumePercent(),
       hasVolumeSlider: Boolean(state.volumeSliderEl),
-      volumeTrackHeightActivePx: CONFIG.volumeTrackHeightActivePx,
-      volumeTrackHeightInactivePx: CONFIG.volumeTrackHeightInactivePx,
+      hasVolumeTrack: Boolean(state.volumeActiveTrackEl),
+      volumeTrackActiveWidth: state.volumeActiveTrackEl ? state.volumeActiveTrackEl.style.width : '',
       fullscreenLayoutFixEnabled: CONFIG.fullscreenLayoutFixEnabled,
       fullscreenLayoutFixRootTag: (state.fullscreenLayoutFixRoot && state.fullscreenLayoutFixRoot.tagName) || '',
       fullscreenHintWatchPagesOnly: CONFIG.fullscreenHintWatchPagesOnly,
