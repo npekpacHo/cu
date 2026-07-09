@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered volume slider, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый ползунок громкости, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, styled remembered volume slider, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, стилизованный запоминаемый ползунок громкости, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.7
+// @version      0.2.8
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -134,6 +134,19 @@
     volumeMaxPercent: 100,
     volumeStepPercent: 1,
     volumeSliderWidthPx: 126,
+
+    /*
+      Визуал ползунка:
+      слева от бегунка активная часть толще, справа неактивная часть тоньше.
+      Почему это не стандартное поведение input[type=range] везде одинаково?
+      Потому что веб, сынок.
+    */
+    volumeTrackHeightActivePx: 6,
+    volumeTrackHeightInactivePx: 2,
+    volumeTrackColorActive: 'rgba(255, 255, 255, 0.86)',
+    volumeTrackColorInactive: 'rgba(255, 255, 255, 0.30)',
+    volumeThumbSizePx: 16,
+
     volumeApplyStoredOnBind: true,
 
     /*
@@ -1417,10 +1430,111 @@ html.${APP_ID}-fs-active body {
 
     try {
       slider.value = String(percent);
+      updateVolumeSliderFill(slider);
       label.textContent = `${percent}%`;
       label.title = `Громкость ${percent}%`;
     } catch {}
   }
+
+
+  function ensureVolumeSliderStyle() {
+    if (!CONFIG.volumeControlEnabled) return;
+
+    try {
+      const styleId = `${APP_ID}-volume-slider-style`;
+      let style = document.getElementById(styleId);
+
+      if (!style) {
+        style = document.createElement('style');
+        style.id = styleId;
+        (document.head || document.documentElement).appendChild(style);
+      }
+
+      const activeHeight = `${CONFIG.volumeTrackHeightActivePx}px`;
+      const inactiveHeight = `${CONFIG.volumeTrackHeightInactivePx}px`;
+      const thumbSize = `${CONFIG.volumeThumbSizePx}px`;
+
+      /*
+        Разный "толстый слева / тонкий справа" делаем не двумя настоящими дорожками,
+        а layered CSS:
+        - сам range получает тонкую базовую дорожку;
+        - активная часть рисуется background-gradient'ом на самом input;
+        - thumb остаётся поверх.
+      */
+      style.textContent = `
+        input.${APP_ID}-volume-slider {
+          --cu-volume-percent: 30%;
+          appearance: none;
+          -webkit-appearance: none;
+          height: ${thumbSize};
+          border: 0;
+          padding: 0;
+          margin: 0;
+          outline: none;
+          background:
+            linear-gradient(${CONFIG.volumeTrackColorActive}, ${CONFIG.volumeTrackColorActive})
+              left 50% / var(--cu-volume-percent) ${activeHeight} no-repeat,
+            linear-gradient(${CONFIG.volumeTrackColorInactive}, ${CONFIG.volumeTrackColorInactive})
+              left 50% / 100% ${inactiveHeight} no-repeat;
+        }
+
+        input.${APP_ID}-volume-slider::-webkit-slider-runnable-track {
+          height: ${thumbSize};
+          background: transparent;
+          border: 0;
+        }
+
+        input.${APP_ID}-volume-slider::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          width: ${thumbSize};
+          height: ${thumbSize};
+          margin-top: 0;
+          border-radius: 999px;
+          border: 2px solid rgba(255, 255, 255, 0.92);
+          background: rgba(255, 255, 255, 0.92);
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.40);
+        }
+
+        input.${APP_ID}-volume-slider::-moz-range-track {
+          height: ${CONFIG.volumeTrackHeightInactivePx}px;
+          background: ${CONFIG.volumeTrackColorInactive};
+          border: 0;
+          border-radius: 999px;
+        }
+
+        input.${APP_ID}-volume-slider::-moz-range-progress {
+          height: ${CONFIG.volumeTrackHeightActivePx}px;
+          background: ${CONFIG.volumeTrackColorActive};
+          border: 0;
+          border-radius: 999px;
+        }
+
+        input.${APP_ID}-volume-slider::-moz-range-thumb {
+          width: ${thumbSize};
+          height: ${thumbSize};
+          border-radius: 999px;
+          border: 2px solid rgba(255, 255, 255, 0.92);
+          background: rgba(255, 255, 255, 0.92);
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.40);
+        }
+      `;
+    } catch {}
+  }
+
+  function updateVolumeSliderFill(slider = state.volumeSliderEl) {
+    if (!slider) return;
+
+    try {
+      const min = Number(slider.min || CONFIG.volumeMinPercent);
+      const max = Number(slider.max || CONFIG.volumeMaxPercent);
+      const value = Number(slider.value || 0);
+      const percent = max > min ? ((value - min) / (max - min)) * 100 : 0;
+
+      slider.style.setProperty('--cu-volume-percent', `${clampNumber(percent, 0, 100)}%`);
+    } catch {}
+  }
+
 
   function createVolumeControl() {
     const group = document.createElement('div');
@@ -1452,8 +1566,11 @@ html.${APP_ID}-fs-active body {
       opacity: '0.9',
     });
 
+    ensureVolumeSliderStyle();
+
     const slider = document.createElement('input');
     slider.type = 'range';
+    slider.className = `${APP_ID}-volume-slider`;
     slider.min = String(CONFIG.volumeMinPercent);
     slider.max = String(CONFIG.volumeMaxPercent);
     slider.step = String(CONFIG.volumeStepPercent);
@@ -1463,7 +1580,7 @@ html.${APP_ID}-fs-active body {
     Object.assign(slider.style, {
       width: `${CONFIG.volumeSliderWidthPx}px`,
       maxWidth: '24vw',
-      accentColor: '#fff',
+      background: 'transparent',
       cursor: 'pointer',
       pointerEvents: 'auto',
       touchAction: 'pan-x',
@@ -1497,6 +1614,7 @@ html.${APP_ID}-fs-active body {
       (event) => {
         event.preventDefault();
         event.stopPropagation();
+        updateVolumeSliderFill(slider);
         setVideoVolumePercent(slider.value, 'slider');
         brightenCustomControls('volume-input');
       },
@@ -1508,6 +1626,7 @@ html.${APP_ID}-fs-active body {
       (event) => {
         event.preventDefault();
         event.stopPropagation();
+        updateVolumeSliderFill(slider);
         setVideoVolumePercent(slider.value, 'slider-change');
         brightenCustomControls('volume-change');
       },
@@ -1520,6 +1639,7 @@ html.${APP_ID}-fs-active body {
 
     state.volumeSliderEl = slider;
     state.volumeLabelEl = label;
+    updateVolumeSliderFill(slider);
 
     return group;
   }
@@ -2174,7 +2294,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.2.7',
+      version: '0.2.8',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -2194,6 +2314,8 @@ html.${APP_ID}-fs-active body {
       volumePercent: getVideoVolumePercent(video),
       storedVolumePercent: readStoredVolumePercent(),
       hasVolumeSlider: Boolean(state.volumeSliderEl),
+      volumeTrackHeightActivePx: CONFIG.volumeTrackHeightActivePx,
+      volumeTrackHeightInactivePx: CONFIG.volumeTrackHeightInactivePx,
       fullscreenLayoutFixEnabled: CONFIG.fullscreenLayoutFixEnabled,
       fullscreenLayoutFixRootTag: (state.fullscreenLayoutFixRoot && state.fullscreenLayoutFixRoot.tagName) || '',
       fullscreenHintWatchPagesOnly: CONFIG.fullscreenHintWatchPagesOnly,
