@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered volume slider, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый ползунок громкости, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.6
+// @version      0.2.7
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -123,6 +123,20 @@
     customControlsSeekSeconds: 10,
 
     /*
+      Управление громкостью рядом с кнопками плеера.
+      Без усиления выше 100%, потому что задача не разбудить соседей и кота,
+      а наоборот смотреть ночью по-человечески.
+    */
+    volumeControlEnabled: true,
+    volumeStorageKey: 'cu:volume:v1',
+    volumeDefaultPercent: 30,
+    volumeMinPercent: 0,
+    volumeMaxPercent: 100,
+    volumeStepPercent: 1,
+    volumeSliderWidthPx: 126,
+    volumeApplyStoredOnBind: true,
+
+    /*
       Для своих кнопок fullscreen стараемся делать на контейнер плеера, а не на <video>.
       Если fullscreen-ить само видео, DOM-кнопки поверх него могут не отображаться вообще.
     */
@@ -173,6 +187,9 @@
     fsHintEl: null,
     customControlsEl: null,
     customControlsHideTimer: 0,
+    volumeAppliedVideo: null,
+    volumeSliderEl: null,
+    volumeLabelEl: null,
     fullscreenLayoutFixRoot: null,
     fullscreenLayoutFixTimerIds: [],
     homeChipsTimer: 0,
@@ -574,9 +591,11 @@
       state.boundVideo.removeEventListener('play', onVideoPlay);
       state.boundVideo.removeEventListener('pause', updateCustomControls);
       state.boundVideo.removeEventListener('timeupdate', updateCustomControls);
+      state.boundVideo.removeEventListener('volumechange', updateVolumeControl);
     }
 
     state.boundVideo = video;
+    applyStoredVolume(video);
 
     video.addEventListener('timeupdate', runSkipCheck, { passive: true });
     video.addEventListener('seeking', runSkipCheck, { passive: true });
@@ -584,6 +603,9 @@
     video.addEventListener('play', onVideoPlay, { passive: true });
     video.addEventListener('pause', updateCustomControls, { passive: true });
     video.addEventListener('timeupdate', updateCustomControls, { passive: true });
+    video.addEventListener('volumechange', updateVolumeControl, { passive: true });
+
+    updateVolumeControl();
 
     scheduleRefresh('bind-video');
     syncFullscreenSoon('bind-video');
@@ -595,11 +617,14 @@
   }
 
   function onVideoMetadata() {
+    applyStoredVolume(getVideo());
+    updateVolumeControl();
     scheduleRefresh('metadata');
     syncFullscreenSoon('metadata');
   }
 
   function onVideoPlay() {
+    updateVolumeControl();
     scheduleRefresh('play');
     syncFullscreenSoon('play');
   }
@@ -1282,6 +1307,224 @@ html.${APP_ID}-fs-active body {
     );
   }
 
+
+  function clampNumber(value, min, max) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return min;
+    return Math.min(max, Math.max(min, num));
+  }
+
+  function normalizeVolumePercent(value) {
+    return clampNumber(value, CONFIG.volumeMinPercent, CONFIG.volumeMaxPercent);
+  }
+
+  function readStoredVolumePercent() {
+    try {
+      const raw = localStorage.getItem(CONFIG.volumeStorageKey);
+      if (raw === null || raw === '') return null;
+
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return null;
+
+      return normalizeVolumePercent(value);
+    } catch {
+      return null;
+    }
+  }
+
+  function writeStoredVolumePercent(percent) {
+    try {
+      localStorage.setItem(CONFIG.volumeStorageKey, String(Math.round(normalizeVolumePercent(percent))));
+    } catch {}
+  }
+
+  function getVideoVolumePercent(video = getVideo()) {
+    if (!video) return CONFIG.volumeDefaultPercent;
+
+    try {
+      if (video.muted) return 0;
+      return Math.round(clampNumber(video.volume * 100, 0, 100));
+    } catch {
+      return CONFIG.volumeDefaultPercent;
+    }
+  }
+
+  function applyStoredVolume(video = getVideo()) {
+    if (!CONFIG.volumeControlEnabled || !CONFIG.volumeApplyStoredOnBind || !video) return false;
+    if (state.volumeAppliedVideo === video) return true;
+
+    const stored = readStoredVolumePercent();
+
+    /*
+      Если значения ещё нет, не навязываем дефолт и не делаем вид, что умнее пользователя.
+      Просто запоминаем текущую громкость YouTube как стартовую.
+    */
+    if (stored === null) {
+      writeStoredVolumePercent(getVideoVolumePercent(video));
+      state.volumeAppliedVideo = video;
+      return false;
+    }
+
+    setVideoVolumePercent(stored, 'stored', false);
+    state.volumeAppliedVideo = video;
+    return true;
+  }
+
+  function setVideoVolumePercent(percent, reason = 'manual', save = true) {
+    const video = getVideo();
+    if (!video) return false;
+
+    const normalized = normalizeVolumePercent(percent);
+
+    try {
+      const volume = normalized / 100;
+
+      video.volume = volume;
+      video.muted = normalized <= 0;
+
+      if (normalized > 0 && video.muted) {
+        video.muted = false;
+      }
+
+      if (save) {
+        writeStoredVolumePercent(normalized);
+      }
+
+      updateVolumeControl();
+
+      if (reason !== 'stored') {
+        toast(`${APP_SHORT}: громкость ${Math.round(normalized)}%`, 650);
+      }
+
+      log('volume set', { reason, percent: normalized });
+      return true;
+    } catch (error) {
+      log('volume set failed:', error);
+      return false;
+    }
+  }
+
+  function updateVolumeControl() {
+    if (!CONFIG.volumeControlEnabled) return;
+
+    const slider = state.volumeSliderEl;
+    const label = state.volumeLabelEl;
+    const video = getVideo();
+
+    if (!slider || !label || !video) return;
+
+    const percent = getVideoVolumePercent(video);
+
+    try {
+      slider.value = String(percent);
+      label.textContent = `${percent}%`;
+      label.title = `Громкость ${percent}%`;
+    } catch {}
+  }
+
+  function createVolumeControl() {
+    const group = document.createElement('div');
+    group.className = `${APP_ID}-volume-control`;
+
+    Object.assign(group.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '7px',
+      marginLeft: '12px',
+      padding: '8px 10px',
+      border: '1px solid rgba(255, 255, 255, 0.10)',
+      borderRadius: '18px',
+      background: 'rgba(0, 0, 0, 0.34)',
+      color: 'rgba(255, 255, 255, 0.88)',
+      boxShadow: '0 3px 14px rgba(0,0,0,.20)',
+      pointerEvents: 'auto',
+      touchAction: 'manipulation',
+      userSelect: 'none',
+      WebkitTapHighlightColor: 'transparent',
+    });
+
+    const icon = document.createElement('span');
+    icon.textContent = '🔉';
+    icon.setAttribute('aria-hidden', 'true');
+
+    Object.assign(icon.style, {
+      font: '17px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      opacity: '0.9',
+    });
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = String(CONFIG.volumeMinPercent);
+    slider.max = String(CONFIG.volumeMaxPercent);
+    slider.step = String(CONFIG.volumeStepPercent);
+    slider.value = String(readStoredVolumePercent() ?? CONFIG.volumeDefaultPercent);
+    slider.setAttribute('aria-label', 'Громкость');
+
+    Object.assign(slider.style, {
+      width: `${CONFIG.volumeSliderWidthPx}px`,
+      maxWidth: '24vw',
+      accentColor: '#fff',
+      cursor: 'pointer',
+      pointerEvents: 'auto',
+      touchAction: 'pan-x',
+    });
+
+    const label = document.createElement('span');
+    label.textContent = `${slider.value}%`;
+    label.className = `${APP_ID}-volume-label`;
+
+    Object.assign(label.style, {
+      minWidth: '34px',
+      textAlign: 'right',
+      font: '12px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      fontWeight: '650',
+      color: 'rgba(255, 255, 255, 0.84)',
+    });
+
+    const stop = (event) => {
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      brightenCustomControls('volume');
+    };
+
+    ['pointerdown', 'touchstart', 'click'].forEach((name) => {
+      group.addEventListener(name, stop, true);
+      slider.addEventListener(name, stop, true);
+    });
+
+    slider.addEventListener(
+      'input',
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setVideoVolumePercent(slider.value, 'slider');
+        brightenCustomControls('volume-input');
+      },
+      true,
+    );
+
+    slider.addEventListener(
+      'change',
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setVideoVolumePercent(slider.value, 'slider-change');
+        brightenCustomControls('volume-change');
+      },
+      true,
+    );
+
+    group.appendChild(icon);
+    group.appendChild(slider);
+    group.appendChild(label);
+
+    state.volumeSliderEl = slider;
+    state.volumeLabelEl = label;
+
+    return group;
+  }
+
+
   function createCustomControlButton(text, title, handler, extraClass = '') {
     const button = document.createElement('button');
     button.type = 'button';
@@ -1358,12 +1601,23 @@ html.${APP_ID}-fs-active body {
         display: 'none',
         alignItems: 'center',
         justifyContent: 'center',
-        gap: '9px',
+        gap: '12px',
         padding: '7px',
-        borderRadius: '21px',
+        borderRadius: '24px',
         background: 'rgba(0, 0, 0, 0.08)',
         backdropFilter: 'blur(2px)',
         WebkitBackdropFilter: 'blur(2px)',
+        pointerEvents: 'none',
+      });
+
+      const buttonGroup = document.createElement('div');
+      buttonGroup.className = `${APP_ID}-button-group`;
+
+      Object.assign(buttonGroup.style, {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: '9px',
         pointerEvents: 'none',
       });
 
@@ -1386,9 +1640,15 @@ html.${APP_ID}-fs-active body {
         () => seekBy(CONFIG.customControlsSeekSeconds),
       );
 
-      wrap.appendChild(back);
-      wrap.appendChild(play);
-      wrap.appendChild(forward);
+      buttonGroup.appendChild(back);
+      buttonGroup.appendChild(play);
+      buttonGroup.appendChild(forward);
+
+      wrap.appendChild(buttonGroup);
+
+      if (CONFIG.volumeControlEnabled) {
+        wrap.appendChild(createVolumeControl());
+      }
 
       state.customControlsEl = wrap;
     }
@@ -1398,6 +1658,7 @@ html.${APP_ID}-fs-active body {
     }
 
     updateCustomControls();
+    updateVolumeControl();
     return state.customControlsEl;
   }
 
@@ -1913,7 +2174,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.2.6',
+      version: '0.2.7',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -1929,6 +2190,10 @@ html.${APP_ID}-fs-active body {
       showFullscreenHintOnLandscape: CONFIG.showFullscreenHintOnLandscape,
       customControlsEnabled: CONFIG.customControlsEnabled,
       customControlsDimOpacity: CONFIG.customControlsDimOpacity,
+      volumeControlEnabled: CONFIG.volumeControlEnabled,
+      volumePercent: getVideoVolumePercent(video),
+      storedVolumePercent: readStoredVolumePercent(),
+      hasVolumeSlider: Boolean(state.volumeSliderEl),
       fullscreenLayoutFixEnabled: CONFIG.fullscreenLayoutFixEnabled,
       fullscreenLayoutFixRootTag: (state.fullscreenLayoutFixRoot && state.fullscreenLayoutFixRoot.tagName) || '',
       fullscreenHintWatchPagesOnly: CONFIG.fullscreenHintWatchPagesOnly,
