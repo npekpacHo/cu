@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.3
+// @version      0.3.4
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -212,8 +212,15 @@
     negativeFeedbackOnShortsBan: true,
     negativeFeedbackOnCardBan: false,
     negativeFeedbackDislikeShorts: true,
-    negativeFeedbackUseMenu: true,
+    /*
+      В 0.3.3 выяснилось, что на активном Shorts кнопка "ещё" открывает
+      bottom sheet настроек плеера: описание, субтитры, дорожка, жалоба и т.п.
+      Пунктов "Не интересно" / "Не рекомендовать канал" там нет.
+      Поэтому на активных Shorts меню не открываем: только локальный бан + дизлайк.
+    */
+    negativeFeedbackUseMenu: false,
     negativeFeedbackPreferDontRecommendChannel: true,
+    negativeFeedbackCloseWrongMenu: true,
     negativeFeedbackMenuOpenDelayMs: 280,
     negativeFeedbackMenuClickDelayMs: 140,
     negativeFeedbackBusyMs: 1800,
@@ -3151,6 +3158,78 @@ html.${APP_ID}-fs-active body {
     return null;
   }
 
+
+  function getOpenYouTubeBottomSheet() {
+    try {
+      return (
+        document.querySelector('.ytSpecBottomSheetLayoutHost') ||
+        document.querySelector('[class*="BottomSheetLayoutHost"]') ||
+        document.querySelector('ytm-bottom-sheet-renderer') ||
+        document.querySelector('[role="dialog"]')
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  function closeYouTubeBottomSheet(reason = 'close') {
+    try {
+      const sheet = getOpenYouTubeBottomSheet();
+      if (!sheet) return false;
+
+      const closeButton = findVisibleClickableByText(
+        sheet,
+        ['закрыть', 'close', 'назад', 'back'],
+        ['отзыв', 'feedback'],
+        {},
+      );
+
+      if (closeButton && safeClickElement(closeButton, `bottom-sheet-${reason}`)) {
+        return true;
+      }
+
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+      document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function isWrongShortsSettingsMenuOpen() {
+    try {
+      const sheet = getOpenYouTubeBottomSheet();
+      if (!sheet) return false;
+
+      const text = normalizeUiText(getElementUiText(sheet));
+
+      const hasSettingsStuff =
+        text.includes('описание') ||
+        text.includes('субтитры') ||
+        text.includes('звуковая дорожка') ||
+        text.includes('добавить в плейлист') ||
+        text.includes('открыть в приложении') ||
+        text.includes('description') ||
+        text.includes('captions') ||
+        text.includes('audio track') ||
+        text.includes('open in app');
+
+      const hasUsefulFeedback =
+        text.includes('не интересно') ||
+        text.includes('не интересует') ||
+        text.includes('не рекомендовать') ||
+        text.includes('not interested') ||
+        text.includes('dont recommend') ||
+        text.includes("don't recommend");
+
+      return hasSettingsStuff && !hasUsefulFeedback;
+    } catch {
+      return false;
+    }
+  }
+
+
   async function clickShortsMenuFeedback() {
     if (!CONFIG.negativeFeedbackUseMenu) return 'disabled';
 
@@ -3163,7 +3242,15 @@ html.${APP_ID}-fs-active body {
       await sleep(CONFIG.negativeFeedbackMenuOpenDelayMs);
 
       const item = findMenuFeedbackItem();
-      if (!item) return 'feedback-item-not-found';
+
+      if (!item) {
+        if (CONFIG.negativeFeedbackCloseWrongMenu && isWrongShortsSettingsMenuOpen()) {
+          closeYouTubeBottomSheet('wrong-menu');
+          return 'wrong-menu-closed';
+        }
+
+        return 'feedback-item-not-found';
+      }
 
       const text = normalizeUiText(getElementUiText(item));
       await sleep(CONFIG.negativeFeedbackMenuClickDelayMs);
@@ -3194,7 +3281,18 @@ html.${APP_ID}-fs-active body {
     if (result.menu === 'not-interested') parts.push('не интересно');
 
     if (!parts.length) {
-      if (result.dislike === 'not-found' && result.menu === 'menu-not-found') return `${APP_SHORT}: YouTube спрятал кнопки`;
+      if (result.dislike === 'not-found' && (result.menu === 'menu-not-found' || result.menu === 'disabled')) {
+        return `${APP_SHORT}: канал скрыт, 👎 не найден`;
+      }
+
+      if (result.menu === 'disabled') {
+        return `${APP_SHORT}: канал скрыт + меню не трогаем`;
+      }
+
+      if (result.menu === 'wrong-menu-closed') {
+        return `${APP_SHORT}: канал скрыт, меню настроек закрыто`;
+      }
+
       return `${APP_SHORT}: канал скрыт локально`;
     }
 
@@ -3589,7 +3687,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.3',
+      version: '0.3.4',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -3630,6 +3728,9 @@ html.${APP_ID}-fs-active body {
       channelBanButtons: document.querySelectorAll(`.${APP_ID}-channel-ban-button`).length,
       shortsBanButtonVisible: Boolean(state.shortsBanButtonEl && state.shortsBanButtonEl.style.display !== 'none'),
       negativeFeedbackEnabled: CONFIG.negativeFeedbackEnabled,
+      negativeFeedbackUseMenu: CONFIG.negativeFeedbackUseMenu,
+      negativeFeedbackCloseWrongMenu: CONFIG.negativeFeedbackCloseWrongMenu,
+      wrongShortsSettingsMenuOpen: isWrongShortsSettingsMenuOpen(),
       shortsDislikeButtonFound: Boolean(findShortsDislikeButton()),
       shortsMoreButtonFound: Boolean(findShortsMoreButton()),
       lastNegativeFeedbackResult: state.lastNegativeFeedbackResult,
