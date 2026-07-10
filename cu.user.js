@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, reliable Shorts channel blacklist, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, надёжный ЧС каналов Shorts, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, reliable Shorts feed blacklist, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, надёжный ЧС каналов общей Shorts-ленты, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.5
+// @version      0.3.6
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -237,6 +237,10 @@
     shortsSkipBannedAfterBanDelayMs: 950,
     shortsSkipBannedCooldownMs: 1600,
     shortsSkipGestureDistancePx: 430,
+    shortsSkipUseNextButton: true,
+    shortsSkipUseKeyboard: true,
+    shortsAdvanceAfterPoopEnabled: true,
+    shortsAdvanceAfterPoopDelayMs: 520,
     shortsRequireStrongChannelForBan: false,
 
     doubleTapSeekEnabled: true,
@@ -359,6 +363,69 @@
     } catch {
       return '';
     }
+  }
+
+  function getVideoIdFromPlayerResponse() {
+    try {
+      const responses = [
+        window.ytInitialPlayerResponse,
+        window.playerResponse,
+      ].filter(Boolean);
+
+      for (const response of responses) {
+        const id = response?.videoDetails?.videoId || response?.currentVideoEndpoint?.watchEndpoint?.videoId || '';
+        if (isValidVideoId(id)) return id;
+      }
+
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  function getVideoIdFromShortsLinks(root = document) {
+    try {
+      const selectors = [
+        'a[href^="/shorts/"]',
+        'a[href*="youtube.com/shorts/"]',
+        'link[rel="canonical"]',
+        'meta[property="og:url"]',
+        'meta[name="twitter:url"]',
+      ];
+
+      for (const selector of selectors) {
+        const nodes = Array.from(root.querySelectorAll?.(selector) || []);
+
+        for (const node of nodes) {
+          const href =
+            node.getAttribute?.('href') ||
+            node.getAttribute?.('content') ||
+            node.href ||
+            '';
+
+          const id = getShortsVideoIdFromUrl(href);
+          if (id) return id;
+        }
+      }
+
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  function getCurrentShortsVideoId() {
+    /*
+      На `/shorts/<id>` всё просто. На общей ленте `/shorts/` URL пустой,
+      поэтому вытаскиваем id из активного DOM, canonical/og или playerResponse.
+    */
+    return (
+      getShortsVideoIdFromUrl() ||
+      getVideoIdFromShortsLinks(getCurrentShortsRoot?.() || document) ||
+      getVideoIdFromShortsLinks(document) ||
+      getVideoIdFromPlayerResponse() ||
+      ''
+    );
   }
 
   function isShortsPage() {
@@ -2874,21 +2941,26 @@ html.${APP_ID}-fs-active body {
 
   function extractCurrentShortsChannelInfo() {
     try {
-      const videoId = getShortsVideoIdFromUrl();
+      const videoId = getCurrentShortsVideoId();
       const root = getCurrentShortsRoot();
 
       /*
-        На активных Shorts сначала берём channelId из playerResponse.
-        Это самый ценный вариант: /channel/UC... переживает переименования,
-        переводы интерфейса и прочие человеческие попытки испортить данные.
+        `/shorts/<id>`: playerResponse обычно самый надёжный.
+        `/shorts/`: URL без id, поэтому сначала пробуем активный DOM,
+        чтобы не забанить канал предыдущего ролика из старого playerResponse.
       */
+      const fromDom = extractChannelInfo(root);
+
+      if (!videoId && fromDom && isStrongChannelInfo(fromDom)) {
+        return fromDom;
+      }
+
       const fromPlayer = extractChannelInfoFromPlayerResponse(videoId);
       if (fromPlayer) return fromPlayer;
 
       const fromData = extractChannelInfoFromInitialData(videoId);
       if (fromData) return fromData;
 
-      const fromDom = extractChannelInfo(root);
       if (fromDom) return fromDom;
 
       /*
@@ -3547,7 +3619,7 @@ html.${APP_ID}-fs-active body {
       reason,
       type: 'shorts',
       channel: info?.name || info?.url || '',
-      videoId: options.videoId || getShortsVideoIdFromUrl(),
+      videoId: options.videoId || getCurrentShortsVideoId(),
       dislike: 'skipped',
       menu: 'skipped',
       at: new Date().toISOString(),
@@ -3605,7 +3677,7 @@ html.${APP_ID}-fs-active body {
       const result = {
         type: 'shorts',
         status: 'no-channel',
-        videoId: getShortsVideoIdFromUrl(),
+        videoId: getCurrentShortsVideoId(),
         at: new Date().toISOString(),
       };
 
@@ -3617,7 +3689,7 @@ html.${APP_ID}-fs-active body {
     return {
       status: 'scheduled',
       channel: info.name || info.url || info.key,
-      videoId: getShortsVideoIdFromUrl(),
+      videoId: getCurrentShortsVideoId(),
     };
   };
 
@@ -3735,7 +3807,7 @@ html.${APP_ID}-fs-active body {
               return;
             }
 
-            const shortsVideoId = getShortsVideoIdFromUrl();
+            const shortsVideoId = getCurrentShortsVideoId();
             const didBan = banChannel(info, {
               source: 'shorts-button',
               videoId: shortsVideoId,
@@ -3743,6 +3815,13 @@ html.${APP_ID}-fs-active body {
 
             if (didBan) {
               sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId });
+
+              if (CONFIG.shortsAdvanceAfterPoopEnabled) {
+                setTimeout(() => {
+                  advanceToNextShort('after-poop');
+                  scheduleBlockedShortsCheck('after-poop-check', CONFIG.shortsSkipBannedDelayMs);
+                }, CONFIG.shortsAdvanceAfterPoopDelayMs);
+              }
             }
           },
           true,
@@ -3796,9 +3875,85 @@ html.${APP_ID}-fs-active body {
       info: normalized,
       matchedAlias,
       bannedItem,
-      videoId: getShortsVideoIdFromUrl(),
+      videoId: getCurrentShortsVideoId(),
     };
   }
+
+
+  function clickShortsNextButton() {
+    if (!CONFIG.shortsSkipUseNextButton) return false;
+
+    try {
+      const include = [
+        'следующее видео',
+        'следующий ролик',
+        'следующее',
+        'next video',
+        'next short',
+        'next',
+      ];
+
+      const exclude = [
+        'предыдущее',
+        'previous',
+        'назад',
+        'back',
+        'комментар',
+        'comment',
+        'поделиться',
+        'share',
+      ];
+
+      const button = findVisibleClickableByText(document, include, exclude, { preferRightRail: true, preferBottom: true });
+
+      if (!button) return false;
+      return safeClickElement(button, 'shorts-next-button');
+    } catch {
+      return false;
+    }
+  }
+
+  function sendShortsNextKeyboard() {
+    if (!CONFIG.shortsSkipUseKeyboard) return false;
+
+    try {
+      const targets = [
+        getCurrentShortsRoot(),
+        document.activeElement,
+        document.body,
+        document.documentElement,
+        document,
+        window,
+      ].filter(Boolean);
+
+      for (const target of targets) {
+        try {
+          target.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'ArrowDown',
+            code: 'ArrowDown',
+            keyCode: 40,
+            which: 40,
+            bubbles: true,
+            cancelable: true,
+          }));
+
+          target.dispatchEvent(new KeyboardEvent('keyup', {
+            key: 'ArrowDown',
+            code: 'ArrowDown',
+            keyCode: 40,
+            which: 40,
+            bubbles: true,
+            cancelable: true,
+          }));
+        } catch {}
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
 
   function dispatchShortsSwipe(distancePx) {
     try {
@@ -3832,8 +3987,15 @@ html.${APP_ID}-fs-active body {
 
   function advanceToNextShort(reason = 'blocked') {
     try {
-      const distance = CONFIG.shortsSkipGestureDistancePx || Math.round((window.innerHeight || 640) * 0.66);
+      const nextClicked = clickShortsNextButton();
 
+      if (nextClicked) {
+        log('advance to next short', { reason, method: 'next-button' });
+        return true;
+      }
+
+      const keySent = sendShortsNextKeyboard();
+      const distance = CONFIG.shortsSkipGestureDistancePx || Math.round((window.innerHeight || 640) * 0.66);
       const swiped = dispatchShortsSwipe(distance);
 
       try {
@@ -3855,8 +4017,8 @@ html.${APP_ID}-fs-active body {
         }));
       } catch {}
 
-      log('advance to next short', { reason, swiped });
-      return true;
+      log('advance to next short', { reason, method: 'keyboard+swipe+scroll', keySent, swiped });
+      return Boolean(keySent || swiped);
     } catch (error) {
       log('advance short failed', error);
       return false;
@@ -3879,7 +4041,7 @@ html.${APP_ID}-fs-active body {
         state.lastBlockedShortsResult = {
           status: 'not-banned',
           reason,
-          videoId: getShortsVideoIdFromUrl(),
+          videoId: getCurrentShortsVideoId(),
           at: new Date().toISOString(),
         };
 
@@ -4090,7 +4252,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.5',
+      version: '0.3.6',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -4124,10 +4286,13 @@ html.${APP_ID}-fs-active body {
       channelFilterEnabled: CONFIG.channelFilterEnabled,
       shortsPage: isShortsPage(),
       sourceShortsPage: isSourceShortsPage(),
-      currentShortsVideoId: getShortsVideoIdFromUrl(),
+      currentShortsVideoId: getCurrentShortsVideoId(),
+      currentShortsVideoIdFromUrl: getShortsVideoIdFromUrl(),
+      currentShortsVideoIdFromPlayer: getVideoIdFromPlayerResponse(),
       currentShortsChannel: extractCurrentShortsChannelInfo(),
       currentShortsBannedInfo: getCurrentShortsBannedInfo(),
       shortsSkipBannedChannelsEnabled: CONFIG.shortsSkipBannedChannelsEnabled,
+      shortsAdvanceAfterPoopEnabled: CONFIG.shortsAdvanceAfterPoopEnabled,
       lastBlockedShortsResult: state.lastBlockedShortsResult,
       bannedChannelsCount: readBannedChannels().length,
       channelBanButtonText: CONFIG.channelBanButtonText,
