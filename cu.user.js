@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.2.9
+// @version      0.3.3
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -77,6 +77,7 @@
       с кнопкой. Такое даже YouTube себе не всегда позволяет.
     */
     fullscreenHintWatchPagesOnly: true,
+    fullscreenHintHideOnShorts: true,
     fullscreenHintScale: 1.5,
 
     exitFullscreenOnPortrait: true,
@@ -171,6 +172,54 @@
     homeChipsCleanupEnabled: true,
     homeChipAllowedLabels: ['все', 'просмотрено', 'новое для вас'],
 
+    /*
+      0.3.0:
+      локальный бан каналов в рекомендациях, Shorts, поиске и похожих карточках.
+      Это не дизлайк и не сигнал YouTube, а наш быстрый санитарный фильтр:
+      нажал ⊘ на карточке, канал ушёл в localStorage, все его карточки скрылись.
+    */
+    channelFilterEnabled: true,
+    channelBanButtonEnabled: true,
+    channelBanStorageKey: 'cu:banned-channels:v1',
+    channelBanButtonText: '💩',
+    channelBanButtonSizePx: 36,
+    channelBanButtonFontPx: 24,
+    channelBanButtonOffsetPx: 8,
+    channelBanButtonOpacity: 0.72,
+    channelBanButtonDimOpacity: 0.38,
+    channelBanScanDelayMs: 180,
+
+    /*
+      0.3.1:
+      отдельная кнопка для настоящей страницы Shorts `/shorts/...`.
+      Там нет обычной карточки, поэтому кнопка должна жить как отдельный fixed overlay.
+    */
+    shortsBanOverlayEnabled: true,
+    shortsBanButtonSizePx: 56,
+    shortsBanButtonFontPx: 34,
+    shortsBanButtonRightPx: 12,
+    shortsBanButtonTopPx: 74,
+    hideBanButtonOnMainWatchVideo: true,
+
+    /*
+      0.3.2:
+      по нажатию ⊘ на Shorts пробуем не только локально скрыть канал,
+      но и отправить YouTube нормальный пользовательский сигнал:
+      дизлайк + "Не интересно" / "Не рекомендовать канал", если пункты доступны.
+      Это не массовая накрутка, а реакция на конкретный мусор, выбранный человеком.
+    */
+    negativeFeedbackEnabled: true,
+    negativeFeedbackOnShortsBan: true,
+    negativeFeedbackOnCardBan: false,
+    negativeFeedbackDislikeShorts: true,
+    negativeFeedbackUseMenu: true,
+    negativeFeedbackPreferDontRecommendChannel: true,
+    negativeFeedbackMenuOpenDelayMs: 280,
+    negativeFeedbackMenuClickDelayMs: 140,
+    negativeFeedbackBusyMs: 1800,
+    negativeFeedbackToastMs: 1100,
+    negativeFeedbackHideCardDelayMs: 450,
+
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
     doubleTapMaxDelayMs: 360,
@@ -209,6 +258,10 @@
     fullscreenLayoutFixRoot: null,
     fullscreenLayoutFixTimerIds: [],
     homeChipsTimer: 0,
+    channelFilterTimer: 0,
+    shortsBanButtonEl: null,
+    negativeFeedbackBusyUntilMs: 0,
+    lastNegativeFeedbackResult: null,
     observer: null,
 
     fullscreenNeedsGesture: false,
@@ -266,6 +319,49 @@
 
   function isWatchLikePage() {
     return Boolean(getVideoIdFromUrl());
+  }
+
+  function getShortsVideoIdFromUrl(urlText = location.href) {
+    try {
+      const url = new URL(urlText, location.origin);
+      const shortsMatch = url.pathname.match(/^\/shorts\/([^/?#]+)/);
+      if (shortsMatch && isValidVideoId(shortsMatch[1])) return shortsMatch[1];
+
+      const sourceMatch = url.pathname.match(/^\/source\/([^/?#]+)\/shorts/);
+      if (sourceMatch && isValidVideoId(sourceMatch[1])) return sourceMatch[1];
+
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  function isShortsPage() {
+    try {
+      return /^\/shorts\//.test(location.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function isSourceShortsPage() {
+    try {
+      return /^\/source\/[^/]+\/shorts/.test(location.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function isFullscreenHintForbiddenPage() {
+    return Boolean(CONFIG.fullscreenHintHideOnShorts && isShortsPage());
+  }
+
+  function shouldShowFullscreenHint() {
+    if (!CONFIG.showFullscreenHintOnLandscape) return false;
+    if (isFullscreenHintForbiddenPage()) return false;
+    if (CONFIG.fullscreenHintWatchPagesOnly && !isWatchLikePage()) return false;
+
+    return true;
   }
 
   function isHomePage() {
@@ -790,6 +886,10 @@
 
   async function enterFullscreen(reason = 'unknown') {
     if (!CONFIG.autoFullscreenOnLandscape) return false;
+    if (isFullscreenHintForbiddenPage()) {
+      hideFullscreenHint();
+      return false;
+    }
     if (!isWatchLikePage()) return false;
     if (!isLandscape()) return false;
     if (isFullscreenActive()) {
@@ -994,6 +1094,11 @@
       clearPortraitExitTimers();
       state.wasLandscape = true;
 
+      if (isFullscreenHintForbiddenPage()) {
+        hideFullscreenHint();
+        return;
+      }
+
       /*
         0.2.4:
         fullscreen автоматически не включаем. В landscape показываем нашу кнопку.
@@ -1006,7 +1111,7 @@
       } else {
         hideCustomControls();
 
-        if (CONFIG.showFullscreenHintOnLandscape) {
+        if (shouldShowFullscreenHint()) {
           showFullscreenHint();
         } else if (CONFIG.autoEnterFullscreenOnLandscape) {
           enterFullscreen(reason);
@@ -1038,7 +1143,7 @@
 
   function showFullscreenHint() {
     try {
-      if (CONFIG.fullscreenHintWatchPagesOnly && !isWatchLikePage()) return;
+      if (!shouldShowFullscreenHint()) return;
       if (!isLandscape() || state.fsHintEl || isFullscreenActive()) return;
       if (!getVideo()) return;
 
@@ -1880,6 +1985,7 @@ html.${APP_ID}-fs-active body {
           [
             `#${APP_ID}-fullscreen-hint`,
             `#${APP_ID}-custom-controls`,
+            `.${APP_ID}-channel-ban-button`,
             `#${APP_ID}-toast`,
             'a',
             'button',
@@ -2096,7 +2202,7 @@ html.${APP_ID}-fs-active body {
         removeFullscreenLayoutFix();
         hideCustomControls();
 
-        if (isLandscape() && CONFIG.showFullscreenHintOnLandscape && (!CONFIG.fullscreenHintWatchPagesOnly || isWatchLikePage())) {
+        if (isLandscape() && shouldShowFullscreenHint()) {
           showFullscreenHint();
         }
       }
@@ -2219,6 +2325,1191 @@ html.${APP_ID}-fs-active body {
   }
 
 
+
+  function ensureChannelFilterStyle() {
+    if (!CONFIG.channelFilterEnabled || !CONFIG.channelBanButtonEnabled) return;
+
+    try {
+      const styleId = `${APP_ID}-channel-filter-style`;
+      let style = document.getElementById(styleId);
+
+      if (!style) {
+        style = document.createElement('style');
+        style.id = styleId;
+        (document.head || document.documentElement).appendChild(style);
+      }
+
+      const size = `${CONFIG.channelBanButtonSizePx}px`;
+      const offset = `${CONFIG.channelBanButtonOffsetPx}px`;
+      const shortsSize = `${CONFIG.shortsBanButtonSizePx}px`;
+
+      style.textContent = `
+        .${APP_ID}-channel-ban-button {
+          position: absolute;
+          top: ${offset};
+          right: ${offset};
+          z-index: 2147483646;
+          width: ${size};
+          height: ${size};
+          min-width: ${size};
+          min-height: ${size};
+          padding: 0;
+          border: 0;
+          border-radius: 999px;
+          background: rgba(0, 0, 0, ${CONFIG.channelBanButtonOpacity});
+          color: rgba(255, 255, 255, 0.94);
+          font: ${CONFIG.channelBanButtonFontPx}px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+          font-weight: 800;
+          box-shadow: 0 2px 10px rgba(0,0,0,.32);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          pointer-events: auto;
+          touch-action: manipulation;
+          -webkit-tap-highlight-color: transparent;
+          user-select: none;
+        }
+
+        .${APP_ID}-channel-ban-button:not(:active) {
+          opacity: ${CONFIG.channelBanButtonDimOpacity};
+        }
+
+        .${APP_ID}-channel-ban-button:hover,
+        .${APP_ID}-channel-ban-button:active {
+          opacity: 1;
+        }
+
+        .${APP_ID}-shorts-ban-button {
+          position: fixed;
+          top: ${CONFIG.shortsBanButtonTopPx}px;
+          right: ${CONFIG.shortsBanButtonRightPx}px;
+          z-index: 2147483647;
+          width: ${shortsSize};
+          height: ${shortsSize};
+          min-width: ${shortsSize};
+          min-height: ${shortsSize};
+          padding: 0;
+          border: 0;
+          border-radius: 999px;
+          background: rgba(0, 0, 0, 0.74);
+          color: rgba(255, 255, 255, 0.96);
+          font: ${CONFIG.shortsBanButtonFontPx}px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+          font-weight: 850;
+          box-shadow: 0 3px 16px rgba(0,0,0,.38);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          pointer-events: auto;
+          touch-action: manipulation;
+          -webkit-tap-highlight-color: transparent;
+          user-select: none;
+          opacity: 0.70;
+        }
+
+        .${APP_ID}-shorts-ban-button:active {
+          opacity: 1;
+          transform: scale(0.96);
+        }
+
+        [data-${APP_ID}-channel-card="1"] {
+          position: relative !important;
+        }
+      `;
+    } catch {}
+  }
+
+  function normalizeChannelPath(path) {
+    return String(path || '')
+      .trim()
+      .replace(/[?#].*$/, '')
+      .replace(/\/+$/, '')
+      .toLowerCase();
+  }
+
+  function normalizeChannelName(name) {
+    return String(name || '')
+      .trim()
+      .replace(/ё/g, 'е')
+      .replace(/\s+/g, ' ')
+      .replace(/\s+подтверждено\s*$/i, '')
+      .toLowerCase();
+  }
+
+  function cleanChannelDisplayName(name) {
+    return String(name || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/\s+Подтверждено\s*$/i, '');
+  }
+
+  function getChannelCardSelector() {
+    return [
+      'ytm-video-with-context-renderer',
+      'ytm-compact-video-renderer',
+      'ytm-rich-item-renderer',
+      'ytm-video-card-renderer',
+      'ytm-reel-item-renderer',
+      'ytm-reel-video-renderer',
+      'ytm-shorts-lockup-view-model',
+      'ytm-shorts-lockup-view-model-v2',
+      'ytm-shorts-lockup-view-model-v3',
+      'ytm-video-renderer',
+    ].join(',');
+  }
+
+  function getVideoLinkFromCard(card) {
+    try {
+      return card.querySelector(
+        [
+          'a[href*="/watch?v="]',
+          'a[href^="/watch?"]',
+          'a[href^="/shorts/"]',
+          'a[href*="youtube.com/watch"]',
+          'a[href*="youtube.com/shorts/"]',
+        ].join(','),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  function getChannelInfoFromUrl(href, fallbackName = '') {
+    try {
+      const url = new URL(href, location.origin);
+      const path = normalizeChannelPath(url.pathname);
+
+      if (!/^\/(@|channel\/|c\/|user\/)/i.test(path)) return null;
+
+      const nameFromPath = decodeURIComponent(path.split('/').filter(Boolean).join('/'));
+      const displayName = cleanChannelDisplayName(fallbackName) || nameFromPath;
+
+      return {
+        key: `url:${path}`,
+        url: path,
+        name: displayName,
+        nameKey: normalizeChannelName(displayName),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+
+  function getVideoIdFromHref(href) {
+    try {
+      const url = new URL(href || '', location.origin);
+
+      const watchId = url.searchParams.get('v');
+      if (isValidVideoId(watchId)) return watchId;
+
+      const shortsMatch = url.pathname.match(/^\/shorts\/([^/?#]+)/);
+      if (shortsMatch && isValidVideoId(shortsMatch[1])) return shortsMatch[1];
+
+      const sourceMatch = url.pathname.match(/^\/source\/([^/?#]+)\/shorts/);
+      if (sourceMatch && isValidVideoId(sourceMatch[1])) return sourceMatch[1];
+
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  function getVideoIdFromCard(card) {
+    try {
+      const link = getVideoLinkFromCard(card);
+      return getVideoIdFromHref(link?.getAttribute('href') || link?.href || '');
+    } catch {
+      return '';
+    }
+  }
+
+  function textFromRunsLike(value) {
+    try {
+      if (!value) return '';
+      if (typeof value === 'string') return value;
+      if (typeof value.simpleText === 'string') return value.simpleText;
+      if (value.accessibility?.accessibilityData?.label) return value.accessibility.accessibilityData.label;
+
+      if (Array.isArray(value.runs)) {
+        return value.runs
+          .map((run) => run?.text || '')
+          .join('')
+          .trim();
+      }
+
+      if (Array.isArray(value)) {
+        return value.map((item) => textFromRunsLike(item)).filter(Boolean).join(' ').trim();
+      }
+
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  function getChannelInfoFromBrowseEndpoint(endpoint, fallbackName = '') {
+    try {
+      const browse = endpoint?.browseEndpoint || endpoint?.commandMetadata?.webCommandMetadata;
+      const browseEndpoint = endpoint?.browseEndpoint || endpoint?.navigationEndpoint?.browseEndpoint || endpoint;
+
+      const canonical =
+        browseEndpoint?.canonicalBaseUrl ||
+        endpoint?.canonicalBaseUrl ||
+        '';
+
+      const browseId =
+        browseEndpoint?.browseId ||
+        endpoint?.browseId ||
+        '';
+
+      if (canonical && /^\/(@|channel\/|c\/|user\/)/i.test(canonical)) {
+        return getChannelInfoFromUrl(canonical, fallbackName);
+      }
+
+      if (browseId && /^UC[\w-]+/i.test(browseId)) {
+        const url = `/channel/${browseId}`;
+        const displayName = cleanChannelDisplayName(fallbackName) || browseId;
+
+        return {
+          key: `url:${normalizeChannelPath(url)}`,
+          url,
+          name: displayName,
+          nameKey: normalizeChannelName(displayName),
+        };
+      }
+
+      if (browse?.url && /^\/(@|channel\/|c\/|user\/)/i.test(browse.url)) {
+        return getChannelInfoFromUrl(browse.url, fallbackName);
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  function findChannelInfoNearObject(root, targetVideoId = '') {
+    const seen = new WeakSet();
+    const queue = [{ value: root, depth: 0 }];
+    const maxNodes = 5000;
+    let visited = 0;
+    let firstChannel = null;
+
+    while (queue.length && visited < maxNodes) {
+      const { value, depth } = queue.shift();
+      visited += 1;
+
+      if (!value || typeof value !== 'object') continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+
+      const maybeName =
+        textFromRunsLike(value.shortBylineText) ||
+        textFromRunsLike(value.longBylineText) ||
+        textFromRunsLike(value.ownerText) ||
+        textFromRunsLike(value.shortByline) ||
+        textFromRunsLike(value.bylineText) ||
+        textFromRunsLike(value.channelName) ||
+        textFromRunsLike(value.author);
+
+      const endpointCandidates = [
+        value.navigationEndpoint,
+        value.command,
+        value.endpoint,
+        value.browseEndpoint,
+        value.shortBylineText?.runs?.[0]?.navigationEndpoint,
+        value.longBylineText?.runs?.[0]?.navigationEndpoint,
+        value.ownerText?.runs?.[0]?.navigationEndpoint,
+      ].filter(Boolean);
+
+      for (const endpoint of endpointCandidates) {
+        const info = getChannelInfoFromBrowseEndpoint(endpoint, maybeName);
+        if (info && !firstChannel) firstChannel = info;
+
+        if (info && (!targetVideoId || value.videoId === targetVideoId || JSON.stringify(value).includes(targetVideoId))) {
+          return info;
+        }
+      }
+
+      if (targetVideoId && value.videoId === targetVideoId && firstChannel) {
+        return firstChannel;
+      }
+
+      if (depth < 8) {
+        for (const key of Object.keys(value)) {
+          const child = value[key];
+
+          if (!child || typeof child !== 'object') continue;
+          queue.push({ value: child, depth: depth + 1 });
+        }
+      }
+    }
+
+    return targetVideoId ? null : firstChannel;
+  }
+
+  function extractChannelInfoFromInitialData(videoId = '') {
+    try {
+      const fromPlayer = extractChannelInfoFromPlayerResponse(videoId);
+      if (fromPlayer) return fromPlayer;
+
+      const data = window.ytInitialData;
+      if (!data) return null;
+
+      return findChannelInfoNearObject(data, videoId) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getCurrentShortsRoot() {
+    try {
+      const selectors = [
+        'ytm-shorts-player',
+        'ytm-reel-video-renderer[is-active]',
+        'ytm-reel-video-renderer[aria-hidden="false"]',
+        'ytm-shorts-video-view-model[is-active]',
+        'ytm-reel-player-overlay-renderer',
+        'reel-player-overlay-renderer',
+      ];
+
+      for (const selector of selectors) {
+        const el = document.querySelector(selector);
+        if (el) return el;
+      }
+
+      return document.body || document.documentElement;
+    } catch {
+      return document.body || document.documentElement;
+    }
+  }
+
+  function extractCurrentShortsChannelInfo() {
+    try {
+      const videoId = getShortsVideoIdFromUrl();
+      const root = getCurrentShortsRoot();
+
+      const fromDom = extractChannelInfo(root);
+      if (fromDom) return fromDom;
+
+      const fromDocument = extractChannelInfo(document);
+      if (fromDocument) return fromDocument;
+
+      const fromData = extractChannelInfoFromInitialData(videoId);
+      if (fromData) return fromData;
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+
+  function extractChannelInfo(card) {
+    if (!card) return null;
+
+    try {
+      const channelLinks = Array.from(card.querySelectorAll?.('a[href]') || []).filter((link) => {
+        const href = link.getAttribute('href') || '';
+        return (
+          /^\/(@|channel\/|c\/|user\/)/i.test(href) ||
+          /youtube\.com\/(@|channel\/|c\/|user\/)/i.test(href)
+        );
+      });
+
+      for (const link of channelLinks) {
+        const label =
+          link.getAttribute('aria-label') ||
+          link.textContent ||
+          link.querySelector?.('[role="text"]')?.textContent ||
+          '';
+
+        const info = getChannelInfoFromUrl(link.getAttribute('href') || link.href || '', label);
+        if (info) return info;
+      }
+
+      /*
+        На source/shorts и похожих лентах ссылка на канал может отсутствовать
+        в видимом DOM, зато может лежать в ytInitialData рядом с videoId.
+      */
+      const videoId = getVideoIdFromCard(card);
+      const fromData = extractChannelInfoFromInitialData(videoId);
+      if (fromData) return fromData;
+
+      /*
+        Fallback по тексту. Ненадёжный, но лучше, чем смотреть на мусор руками.
+      */
+      const textSelectors = [
+        '[class*="byline"]',
+        '[class*="channel"]',
+        '[class*="owner"]',
+        '[class*="author"]',
+        'ytm-badge-and-byline-renderer',
+        'ytm-shorts-lockup-view-model',
+        'ytm-reel-player-overlay-renderer',
+        '.subhead',
+        '.metadata',
+        '.secondary-text',
+      ];
+
+      for (const selector of textSelectors) {
+        const el = card.querySelector?.(selector);
+        const raw = cleanChannelDisplayName(el?.textContent || el?.getAttribute?.('aria-label') || '');
+
+        if (!raw) continue;
+
+        const parts = raw
+          .split(/[•·\n]/)
+          .map((part) => cleanChannelDisplayName(part))
+          .filter(Boolean);
+
+        const candidate = parts.find((part) => {
+          const lower = part.toLowerCase();
+          return (
+            part.length >= 2 &&
+            !lower.includes('просмотр') &&
+            !lower.includes('views') &&
+            !lower.includes('назад') &&
+            !lower.includes('ago') &&
+            !lower.includes('shorts') &&
+            !lower.includes('комментар') &&
+            !lower.includes('поделиться') &&
+            !lower.includes('подпис') &&
+            !lower.includes('like') &&
+            !lower.includes('share')
+          );
+        });
+
+        if (candidate) {
+          const key = normalizeChannelName(candidate);
+
+          return {
+            key: `name:${key}`,
+            url: '',
+            name: candidate,
+            nameKey: key,
+          };
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  function readBannedChannels() {
+    try {
+      const raw = localStorage.getItem(CONFIG.channelBanStorageKey);
+      if (!raw) return [];
+
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+
+      return parsed.filter((item) => item && item.key);
+    } catch {
+      return [];
+    }
+  }
+
+  function writeBannedChannels(items) {
+    try {
+      localStorage.setItem(CONFIG.channelBanStorageKey, JSON.stringify(items || []));
+    } catch {}
+  }
+
+  function getBannedChannelMap() {
+    const items = readBannedChannels();
+    const map = new Map();
+
+    for (const item of items) {
+      if (item.key) map.set(item.key, item);
+      if (item.nameKey) map.set(`name:${item.nameKey}`, item);
+      if (item.url) map.set(`url:${normalizeChannelPath(item.url)}`, item);
+    }
+
+    return map;
+  }
+
+  function isChannelBanned(info, map = getBannedChannelMap()) {
+    if (!info) return false;
+
+    return Boolean(
+      map.has(info.key) ||
+        (info.nameKey && map.has(`name:${info.nameKey}`)) ||
+        (info.url && map.has(`url:${normalizeChannelPath(info.url)}`)),
+    );
+  }
+
+  function banChannel(info) {
+    if (!CONFIG.channelFilterEnabled || !info) return false;
+
+    const items = readBannedChannels();
+    const map = getBannedChannelMap();
+
+    if (isChannelBanned(info, map)) {
+      toast(`${APP_SHORT}: канал уже скрыт`);
+      return true;
+    }
+
+    const item = {
+      key: info.key,
+      name: info.name || info.url || info.key,
+      nameKey: info.nameKey || normalizeChannelName(info.name),
+      url: info.url || '',
+      bannedAt: new Date().toISOString(),
+    };
+
+    items.push(item);
+    writeBannedChannels(items);
+
+    toast(`${APP_SHORT}: скрыт канал ${item.name}`, 1300);
+    scheduleChannelFilter('ban');
+
+    return true;
+  }
+
+  function unbanChannel(query) {
+    const needle = normalizeChannelName(query);
+    const pathNeedle = normalizeChannelPath(query);
+    const before = readBannedChannels();
+
+    const after = before.filter((item) => {
+      return !(
+        item.key === query ||
+        normalizeChannelName(item.name) === needle ||
+        item.nameKey === needle ||
+        normalizeChannelPath(item.url) === pathNeedle
+      );
+    });
+
+    writeBannedChannels(after);
+    scheduleChannelFilter('unban');
+
+    return {
+      removed: before.length - after.length,
+      items: after,
+    };
+  }
+
+  function clearBannedChannels() {
+    writeBannedChannels([]);
+    scheduleChannelFilter('clear');
+    return [];
+  }
+
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function normalizeUiText(text) {
+    return String(text || '')
+      .trim()
+      .toLowerCase()
+      .replace(/ё/g, 'е')
+      .replace(/\s+/g, ' ');
+  }
+
+  function getElementUiText(el) {
+    try {
+      if (!el) return '';
+
+      return [
+        el.getAttribute?.('aria-label'),
+        el.getAttribute?.('title'),
+        el.getAttribute?.('data-tooltip-text'),
+        el.textContent,
+      ]
+        .filter(Boolean)
+        .join(' ');
+    } catch {
+      return '';
+    }
+  }
+
+  function isElementVisible(el) {
+    try {
+      if (!el || !el.getBoundingClientRect) return false;
+
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 4 || rect.height < 4) return false;
+      if (rect.bottom < 0 || rect.right < 0) return false;
+      if (rect.top > (window.innerHeight || 0)) return false;
+      if (rect.left > (window.innerWidth || 0)) return false;
+
+      const style = getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0.01;
+    } catch {
+      return false;
+    }
+  }
+
+  function getClickableElement(el) {
+    try {
+      return (
+        el.closest?.('button, [role="button"], [role="menuitem"], ytm-menu-service-item-renderer, tp-yt-paper-item, a[href]') ||
+        el
+      );
+    } catch {
+      return el;
+    }
+  }
+
+  function safeClickElement(el, reason = 'click') {
+    try {
+      const target = getClickableElement(el);
+      if (!target || !isElementVisible(target)) return false;
+
+      target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'touch' }));
+      target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }));
+      target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+      target.click();
+
+      log('safe click', reason, getElementUiText(target));
+      return true;
+    } catch {
+      try {
+        el.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  function findVisibleClickableByText(root, includeTerms, excludeTerms = [], options = {}) {
+    try {
+      const scope = root || document;
+      const include = includeTerms.map(normalizeUiText).filter(Boolean);
+      const exclude = excludeTerms.map(normalizeUiText).filter(Boolean);
+
+      const nodes = Array.from(
+        scope.querySelectorAll?.(
+          [
+            'button',
+            '[role="button"]',
+            '[role="menuitem"]',
+            'ytm-menu-service-item-renderer',
+            'tp-yt-paper-item',
+            'a[aria-label]',
+            '[aria-label]',
+            '[title]',
+          ].join(','),
+        ) || [],
+      );
+
+      const candidates = [];
+
+      for (const node of nodes) {
+        const clickable = getClickableElement(node);
+        if (!clickable || !isElementVisible(clickable)) continue;
+
+        const text = normalizeUiText(getElementUiText(node) || getElementUiText(clickable));
+        if (!text) continue;
+        if (!include.some((term) => text.includes(term))) continue;
+        if (exclude.some((term) => text.includes(term))) continue;
+
+        const rect = clickable.getBoundingClientRect();
+        let score = 0;
+
+        if (options.preferRightRail && rect.left > (window.innerWidth || 0) * 0.45) score += 10;
+        if (options.preferTop && rect.top < (window.innerHeight || 0) * 0.55) score += 3;
+        if (options.preferBottom && rect.top > (window.innerHeight || 0) * 0.45) score += 3;
+
+        score -= Math.abs(rect.left - (window.innerWidth || 0) * 0.82) / 100;
+        score -= Math.abs(rect.top - (window.innerHeight || 0) * 0.55) / 140;
+
+        candidates.push({ node: clickable, text, score });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates[0]?.node || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function isToggleAlreadyPressed(el) {
+    try {
+      const target = getClickableElement(el);
+      const text = normalizeUiText(getElementUiText(target));
+
+      return (
+        target?.getAttribute?.('aria-pressed') === 'true' ||
+        target?.getAttribute?.('aria-checked') === 'true' ||
+        text.includes('отменить отметку') ||
+        text.includes('убрать отметку') ||
+        text.includes('remove dislike') ||
+        text.includes('undo dislike')
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function findShortsDislikeButton() {
+    const root = getCurrentShortsRoot();
+
+    const include = [
+      'не нравится',
+      'dislike',
+    ];
+
+    const exclude = [
+      'не интересно',
+      'not interested',
+      'отменить отметку',
+      'remove dislike',
+      'комментар',
+      'comment',
+      'поделиться',
+      'share',
+      'жалоба',
+      'report',
+    ];
+
+    return (
+      findVisibleClickableByText(root, include, exclude, { preferRightRail: true }) ||
+      findVisibleClickableByText(document, include, exclude, { preferRightRail: true })
+    );
+  }
+
+  function clickShortsDislike() {
+    if (!CONFIG.negativeFeedbackDislikeShorts) return 'disabled';
+
+    try {
+      const button = findShortsDislikeButton();
+
+      if (!button) return 'not-found';
+      if (isToggleAlreadyPressed(button)) return 'already';
+
+      return safeClickElement(button, 'shorts-dislike') ? 'clicked' : 'failed';
+    } catch {
+      return 'failed';
+    }
+  }
+
+  function findShortsMoreButton() {
+    const root = getCurrentShortsRoot();
+
+    const include = [
+      'еще',
+      'ещё',
+      'другие действия',
+      'more',
+      'more actions',
+    ];
+
+    const exclude = [
+      'поделиться',
+      'share',
+      'комментар',
+      'comment',
+      'поиск',
+      'search',
+      'создать',
+      'create',
+      'голосовой',
+      'voice',
+    ];
+
+    return (
+      findVisibleClickableByText(root, include, exclude, { preferRightRail: true, preferBottom: true }) ||
+      findVisibleClickableByText(document, include, exclude, { preferRightRail: true, preferBottom: true })
+    );
+  }
+
+  function findMenuFeedbackItem() {
+    const terms = CONFIG.negativeFeedbackPreferDontRecommendChannel
+      ? [
+          ['не рекомендовать видео с этого канала', 'dont recommend channel', "don't recommend channel"],
+          ['не интересно', 'не интересует', 'not interested'],
+        ]
+      : [
+          ['не интересно', 'не интересует', 'not interested'],
+          ['не рекомендовать видео с этого канала', 'dont recommend channel', "don't recommend channel"],
+        ];
+
+    const exclude = [
+      'отменить',
+      'undo',
+      'отмена',
+      'cancel',
+      'пожаловаться',
+      'report',
+      'отправить отзыв',
+      'send feedback',
+    ];
+
+    for (const group of terms) {
+      const item = findVisibleClickableByText(document, group, exclude, {});
+      if (item) return item;
+    }
+
+    return null;
+  }
+
+  async function clickShortsMenuFeedback() {
+    if (!CONFIG.negativeFeedbackUseMenu) return 'disabled';
+
+    try {
+      const more = findShortsMoreButton();
+      if (!more) return 'menu-not-found';
+
+      if (!safeClickElement(more, 'shorts-menu')) return 'menu-click-failed';
+
+      await sleep(CONFIG.negativeFeedbackMenuOpenDelayMs);
+
+      const item = findMenuFeedbackItem();
+      if (!item) return 'feedback-item-not-found';
+
+      const text = normalizeUiText(getElementUiText(item));
+      await sleep(CONFIG.negativeFeedbackMenuClickDelayMs);
+
+      if (!safeClickElement(item, 'shorts-menu-feedback')) return 'feedback-click-failed';
+
+      if (text.includes('не рекомендовать') || text.includes('dont recommend') || text.includes("don't recommend")) {
+        return 'dont-recommend-channel';
+      }
+
+      if (text.includes('не интересно') || text.includes('не интересует') || text.includes('not interested')) {
+        return 'not-interested';
+      }
+
+      return 'clicked';
+    } catch {
+      return 'failed';
+    }
+  }
+
+  function buildNegativeFeedbackToast(result) {
+    const parts = [];
+
+    if (result.dislike === 'clicked') parts.push('👎');
+    if (result.dislike === 'already') parts.push('👎 уже');
+
+    if (result.menu === 'dont-recommend-channel') parts.push('не рекомендовать');
+    if (result.menu === 'not-interested') parts.push('не интересно');
+
+    if (!parts.length) {
+      if (result.dislike === 'not-found' && result.menu === 'menu-not-found') return `${APP_SHORT}: YouTube спрятал кнопки`;
+      return `${APP_SHORT}: канал скрыт локально`;
+    }
+
+    return `${APP_SHORT}: ${parts.join(' + ')}`;
+  }
+
+  async function sendShortsNegativeFeedback(info, reason = 'shorts') {
+    if (!CONFIG.negativeFeedbackEnabled || !CONFIG.negativeFeedbackOnShortsBan) return null;
+
+    const now = Date.now();
+    if (now < state.negativeFeedbackBusyUntilMs) {
+      return state.lastNegativeFeedbackResult || null;
+    }
+
+    state.negativeFeedbackBusyUntilMs = now + CONFIG.negativeFeedbackBusyMs;
+
+    const result = {
+      reason,
+      type: 'shorts',
+      channel: info?.name || info?.url || '',
+      videoId: getShortsVideoIdFromUrl(),
+      dislike: 'skipped',
+      menu: 'skipped',
+      at: new Date().toISOString(),
+    };
+
+    try {
+      result.dislike = clickShortsDislike();
+
+      if (CONFIG.negativeFeedbackUseMenu) {
+        result.menu = await clickShortsMenuFeedback();
+      }
+
+      state.lastNegativeFeedbackResult = result;
+
+      if (CONFIG.showToasts) {
+        toast(buildNegativeFeedbackToast(result), CONFIG.negativeFeedbackToastMs);
+      }
+
+      log('negative feedback result', result);
+      return result;
+    } catch (error) {
+      result.error = String(error && error.message ? error.message : error);
+      state.lastNegativeFeedbackResult = result;
+      log('negative feedback failed', result);
+      return result;
+    }
+  }
+
+  async function sendCardNegativeFeedback(card, info, reason = 'card') {
+    if (!CONFIG.negativeFeedbackEnabled || !CONFIG.negativeFeedbackOnCardBan) return null;
+
+    /*
+      Пока карточки не трогаем по умолчанию: на карточке нет дизлайка,
+      а меню YouTube слишком часто меняет структуру. Функция оставлена как точка расширения.
+    */
+    const result = {
+      reason,
+      type: 'card',
+      channel: info?.name || info?.url || '',
+      at: new Date().toISOString(),
+      status: 'disabled-by-default',
+    };
+
+    state.lastNegativeFeedbackResult = result;
+    return result;
+  }
+
+  window.cuLastFeedback = function cuLastFeedback() {
+    return state.lastNegativeFeedbackResult;
+  };
+
+  window.cuFeedbackCurrentShorts = function cuFeedbackCurrentShorts() {
+    const info = extractCurrentShortsChannelInfo();
+    if (!info) {
+      const result = {
+        type: 'shorts',
+        status: 'no-channel',
+        videoId: getShortsVideoIdFromUrl(),
+        at: new Date().toISOString(),
+      };
+
+      state.lastNegativeFeedbackResult = result;
+      return result;
+    }
+
+    sendShortsNegativeFeedback(info, 'manual-console');
+    return {
+      status: 'scheduled',
+      channel: info.name || info.url || info.key,
+      videoId: getShortsVideoIdFromUrl(),
+    };
+  };
+
+
+  function hideChannelCard(card, info) {
+    try {
+      card.style.display = 'none';
+      card.dataset.cuChannelHidden = '1';
+
+      if (info?.name) {
+        card.dataset.cuChannelName = info.name;
+      }
+    } catch {}
+  }
+
+  function restoreChannelCard(card) {
+    try {
+      if (card.dataset.cuChannelHidden === '1') {
+        card.style.removeProperty('display');
+        delete card.dataset.cuChannelHidden;
+        delete card.dataset.cuChannelName;
+      }
+    } catch {}
+  }
+
+  function findChannelCardFromTarget(target) {
+    try {
+      return target?.closest?.(getChannelCardSelector()) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function ensureBanButton(card) {
+    if (!CONFIG.channelBanButtonEnabled || !card) return;
+
+    try {
+      if (card.querySelector(`.${APP_ID}-channel-ban-button`)) return;
+
+      const videoLink = getVideoLinkFromCard(card);
+      if (!videoLink) return;
+
+      card.dataset.cuChannelCard = '1';
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `${APP_ID}-channel-ban-button`;
+      button.textContent = CONFIG.channelBanButtonText;
+      button.title = 'Скрыть канал';
+      button.setAttribute('aria-label', 'Скрыть канал');
+
+      button.addEventListener(
+        'click',
+        (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
+          const currentCard = findChannelCardFromTarget(event.target) || card;
+          const info = extractChannelInfo(currentCard);
+
+          if (!info) {
+            toast(`${APP_SHORT}: не нашёл канал`, 1100);
+            return;
+          }
+
+          const didBan = banChannel(info);
+          if (didBan && CONFIG.negativeFeedbackOnCardBan) {
+            sendCardNegativeFeedback(currentCard, info, 'card-ban');
+            setTimeout(() => hideChannelCard(currentCard, info), CONFIG.negativeFeedbackHideCardDelayMs);
+          } else {
+            hideChannelCard(currentCard, info);
+          }
+        },
+        true,
+      );
+
+      card.appendChild(button);
+    } catch {}
+  }
+
+
+  function ensureShortsBanButton() {
+    if (!CONFIG.channelFilterEnabled || !CONFIG.channelBanButtonEnabled || !CONFIG.shortsBanOverlayEnabled) return;
+    if (!isShortsPage()) {
+      hideShortsBanButton();
+      return;
+    }
+
+    try {
+      ensureChannelFilterStyle();
+
+      if (!state.shortsBanButtonEl) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `${APP_ID}-shorts-ban-button`;
+        button.textContent = CONFIG.channelBanButtonText;
+        button.title = 'Скрыть канал Shorts';
+        button.setAttribute('aria-label', 'Скрыть канал Shorts');
+
+        button.addEventListener(
+          'click',
+          (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
+            const info = extractCurrentShortsChannelInfo();
+
+            if (!info) {
+              toast(`${APP_SHORT}: не нашёл канал Shorts`, 1200);
+              return;
+            }
+
+            const didBan = banChannel(info);
+
+            if (didBan) {
+              sendShortsNegativeFeedback(info, 'shorts-ban');
+            }
+          },
+          true,
+        );
+
+        state.shortsBanButtonEl = button;
+      }
+
+      const root = document.body || document.documentElement;
+      if (state.shortsBanButtonEl.parentNode !== root) {
+        root.appendChild(state.shortsBanButtonEl);
+      }
+
+      state.shortsBanButtonEl.style.display = 'flex';
+    } catch {}
+  }
+
+  function hideShortsBanButton() {
+    try {
+      if (state.shortsBanButtonEl) {
+        state.shortsBanButtonEl.style.display = 'none';
+      }
+    } catch {}
+  }
+
+  function syncShortsBanButton() {
+    if (isShortsPage()) {
+      ensureShortsBanButton();
+    } else {
+      hideShortsBanButton();
+    }
+  }
+
+
+  function processChannelCards(reason = 'process') {
+    if (!CONFIG.channelFilterEnabled) return;
+
+    try {
+      ensureChannelFilterStyle();
+      syncShortsBanButton();
+
+      const cards = Array.from(document.querySelectorAll(getChannelCardSelector()));
+      const bannedMap = getBannedChannelMap();
+
+      for (const card of cards) {
+        /*
+          На обычной watch-странице кнопка на основном видео не нужна.
+          Там нет смысла банить канал через сам плеер, а вот в рекомендациях и Shorts
+          санитарная кнопка полезна. Поэтому карточки с настоящим <video> пропускаем:
+          активный Shorts обрабатывается отдельной fixed-кнопкой.
+        */
+        if (CONFIG.hideBanButtonOnMainWatchVideo && card.querySelector?.('video')) {
+          restoreChannelCard(card);
+          continue;
+        }
+
+        const videoLink = getVideoLinkFromCard(card);
+
+        if (!videoLink) {
+          restoreChannelCard(card);
+          continue;
+        }
+
+        const info = extractChannelInfo(card);
+
+        if (info && isChannelBanned(info, bannedMap)) {
+          hideChannelCard(card, info);
+          continue;
+        }
+
+        restoreChannelCard(card);
+        ensureBanButton(card);
+      }
+
+      log('channel cards processed', {
+        reason,
+        cards: cards.length,
+        banned: bannedMap.size,
+        shortsButton: Boolean(state.shortsBanButtonEl && state.shortsBanButtonEl.style.display !== 'none'),
+      });
+    } catch (error) {
+      log('channel filter failed:', error);
+    }
+  }
+
+  function scheduleChannelFilter(reason = 'scheduled') {
+    if (!CONFIG.channelFilterEnabled) return;
+
+    clearTimeout(state.channelFilterTimer);
+    state.channelFilterTimer = setTimeout(() => processChannelCards(reason), CONFIG.channelBanScanDelayMs);
+  }
+
+  window.cuListBannedChannels = function cuListBannedChannels() {
+    return readBannedChannels();
+  };
+
+  window.cuUnbanChannel = function cuUnbanChannel(query) {
+    return unbanChannel(query);
+  };
+
+  window.cuClearBannedChannels = function cuClearBannedChannels() {
+    return clearBannedChannels();
+  };
+
+
+
   function onUrlMaybeChanged(reason = 'url') {
     const href = location.href;
     if (href === state.currentUrl) return;
@@ -2231,11 +3522,13 @@ html.${APP_ID}-fs-active body {
     state.lastSkipAtMs = 0;
     state.lastTap.time = 0;
     hideCustomControls();
+    syncShortsBanButton();
 
     scheduleBind();
     scheduleRefresh(reason);
     syncFullscreenSoon(reason);
     scheduleHomeChipsCleanup(reason);
+    scheduleChannelFilter(reason);
   }
 
   function installRouteWatchers() {
@@ -2272,6 +3565,7 @@ html.${APP_ID}-fs-active body {
       state.observer = new MutationObserver(() => {
         scheduleBind();
         scheduleHomeChipsCleanup('mutation');
+        scheduleChannelFilter('mutation');
 
         if (location.href !== state.currentUrl) {
           onUrlMaybeChanged('mutation-url');
@@ -2295,7 +3589,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.2.9',
+      version: '0.3.3',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -2320,9 +3614,26 @@ html.${APP_ID}-fs-active body {
       fullscreenLayoutFixEnabled: CONFIG.fullscreenLayoutFixEnabled,
       fullscreenLayoutFixRootTag: (state.fullscreenLayoutFixRoot && state.fullscreenLayoutFixRoot.tagName) || '',
       fullscreenHintWatchPagesOnly: CONFIG.fullscreenHintWatchPagesOnly,
+      fullscreenHintHideOnShorts: CONFIG.fullscreenHintHideOnShorts,
+      fullscreenHintForbiddenPage: isFullscreenHintForbiddenPage(),
+      shouldShowFullscreenHint: shouldShowFullscreenHint(),
       fullscreenHintScale: CONFIG.fullscreenHintScale,
       homePage: isHomePage(),
       homeChipsCleanupEnabled: CONFIG.homeChipsCleanupEnabled,
+      channelFilterEnabled: CONFIG.channelFilterEnabled,
+      shortsPage: isShortsPage(),
+      sourceShortsPage: isSourceShortsPage(),
+      currentShortsVideoId: getShortsVideoIdFromUrl(),
+      currentShortsChannel: extractCurrentShortsChannelInfo(),
+      bannedChannelsCount: readBannedChannels().length,
+      channelBanButtonText: CONFIG.channelBanButtonText,
+      channelBanButtons: document.querySelectorAll(`.${APP_ID}-channel-ban-button`).length,
+      shortsBanButtonVisible: Boolean(state.shortsBanButtonEl && state.shortsBanButtonEl.style.display !== 'none'),
+      negativeFeedbackEnabled: CONFIG.negativeFeedbackEnabled,
+      shortsDislikeButtonFound: Boolean(findShortsDislikeButton()),
+      shortsMoreButtonFound: Boolean(findShortsMoreButton()),
+      lastNegativeFeedbackResult: state.lastNegativeFeedbackResult,
+      hiddenChannelCards: document.querySelectorAll('[data-cu-channel-hidden="1"]').length,
       videoRect: getVideoRectInfo(),
       hasFullscreenHint: Boolean(state.fsHintEl),
       hasCustomControls: Boolean(state.customControlsEl),
@@ -2346,6 +3657,7 @@ html.${APP_ID}-fs-active body {
     scheduleRefresh('init');
     syncFullscreenSoon('init');
     scheduleHomeChipsCleanup('init');
+    scheduleChannelFilter('init');
 
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
@@ -2354,6 +3666,7 @@ html.${APP_ID}-fs-active body {
         syncFullscreenSoon('visibility');
         syncCustomControls('visibility');
         scheduleHomeChipsCleanup('visibility');
+        scheduleChannelFilter('visibility');
       }
     });
   }
