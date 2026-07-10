@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, reliable Shorts channel blacklist, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, надёжный ЧС каналов Shorts, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.4
+// @version      0.3.5
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -227,6 +227,18 @@
     negativeFeedbackToastMs: 1100,
     negativeFeedbackHideCardDelayMs: 450,
 
+    /*
+      0.3.5:
+      ЧС должен работать как ЧС, а не как пожелание доброго утра.
+      Если канал забанен и снова всплыл в активном Shorts, пролистываем его дальше.
+    */
+    shortsSkipBannedChannelsEnabled: true,
+    shortsSkipBannedDelayMs: 360,
+    shortsSkipBannedAfterBanDelayMs: 950,
+    shortsSkipBannedCooldownMs: 1600,
+    shortsSkipGestureDistancePx: 430,
+    shortsRequireStrongChannelForBan: false,
+
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
     doubleTapMaxDelayMs: 360,
@@ -267,6 +279,12 @@
     homeChipsTimer: 0,
     channelFilterTimer: 0,
     shortsBanButtonEl: null,
+    blockedShortsTimer: 0,
+    lastBlockedShortsSkipAtMs: 0,
+    lastBlockedShortsVideoId: '',
+    lastBannedShortsVideoId: '',
+    lastBannedShortsChannelKey: '',
+    lastBlockedShortsResult: null,
     negativeFeedbackBusyUntilMs: 0,
     lastNegativeFeedbackResult: null,
     observer: null,
@@ -2487,19 +2505,179 @@ html.${APP_ID}-fs-active body {
 
       if (!/^\/(@|channel\/|c\/|user\/)/i.test(path)) return null;
 
-      const nameFromPath = decodeURIComponent(path.split('/').filter(Boolean).join('/'));
+      const parts = path.split('/').filter(Boolean);
+      const first = parts[0] || '';
+      const second = parts[1] || '';
+      const channelId = first === 'channel' && /^UC[\w-]+/i.test(second) ? second : '';
+      const handle = first.startsWith('@') ? first : '';
+      const nameFromPath = decodeURIComponent(parts.join('/'));
       const displayName = cleanChannelDisplayName(fallbackName) || nameFromPath;
 
-      return {
-        key: `url:${path}`,
+      return normalizeChannelInfo({
+        key: channelId ? `channel:${channelId.toLowerCase()}` : `url:${path}`,
         url: path,
+        channelId,
+        handle,
         name: displayName,
         nameKey: normalizeChannelName(displayName),
-      };
+        source: 'url',
+        confidence: channelId || handle ? 'strong' : 'medium',
+      });
     } catch {
       return null;
     }
   }
+
+
+
+  function normalizeChannelId(channelId) {
+    return String(channelId || '').trim();
+  }
+
+  function normalizeHandle(handle) {
+    const value = String(handle || '').trim().toLowerCase();
+    if (!value) return '';
+    return value.startsWith('@') ? value : `@${value}`;
+  }
+
+  function getChannelAliases(info) {
+    const aliases = new Set();
+
+    try {
+      if (!info) return [];
+
+      const key = String(info.key || '').trim();
+      const url = normalizeChannelPath(info.url || '');
+      const channelId = normalizeChannelId(info.channelId || '');
+      const handle = normalizeHandle(info.handle || '');
+      const nameKey = normalizeChannelName(info.nameKey || info.name || '');
+
+      if (key) aliases.add(key);
+      if (url) aliases.add(`url:${url}`);
+      if (channelId) {
+        aliases.add(`channel:${channelId.toLowerCase()}`);
+        aliases.add(`url:/channel/${channelId}`.toLowerCase());
+      }
+      if (handle) {
+        aliases.add(`handle:${handle}`);
+        aliases.add(`url:/${handle}`);
+      }
+      if (nameKey) aliases.add(`name:${nameKey}`);
+
+      if (Array.isArray(info.keys)) {
+        info.keys.forEach((item) => {
+          const value = String(item || '').trim();
+          if (value) aliases.add(value);
+        });
+      }
+
+      if (Array.isArray(info.aliases)) {
+        info.aliases.forEach((item) => {
+          const value = String(item || '').trim();
+          if (value) aliases.add(value);
+        });
+      }
+    } catch {}
+
+    return Array.from(aliases);
+  }
+
+  function normalizeChannelInfo(info) {
+    if (!info) return null;
+
+    const channelId = normalizeChannelId(info.channelId || '');
+    const handle = normalizeHandle(info.handle || '');
+    const url = normalizeChannelPath(info.url || (channelId ? `/channel/${channelId}` : handle ? `/${handle}` : ''));
+    const name = cleanChannelDisplayName(info.name || info.title || url || channelId || handle || info.key || '');
+    const nameKey = normalizeChannelName(info.nameKey || name);
+
+    const normalized = {
+      key:
+        info.key ||
+        (channelId ? `channel:${channelId.toLowerCase()}` : '') ||
+        (handle ? `handle:${handle}` : '') ||
+        (url ? `url:${url}` : '') ||
+        (nameKey ? `name:${nameKey}` : ''),
+      url,
+      channelId,
+      handle,
+      name,
+      nameKey,
+      source: info.source || '',
+      confidence: info.confidence || (channelId || handle || url ? 'strong' : 'weak'),
+    };
+
+    normalized.aliases = getChannelAliases(normalized);
+
+    return normalized;
+  }
+
+  function isStrongChannelInfo(info) {
+    const normalized = normalizeChannelInfo(info);
+    if (!normalized) return false;
+
+    return Boolean(
+      normalized.channelId ||
+        normalized.handle ||
+        /^\/(@|channel\/|c\/|user\/)/i.test(normalized.url || '') ||
+        String(normalized.key || '').startsWith('channel:') ||
+        String(normalized.key || '').startsWith('handle:') ||
+        String(normalized.key || '').startsWith('url:/@') ||
+        String(normalized.key || '').startsWith('url:/channel/'),
+    );
+  }
+
+  function extractChannelInfoFromPlayerResponse(videoId = '') {
+    try {
+      const responses = [
+        window.ytInitialPlayerResponse,
+        window.playerResponse,
+      ].filter(Boolean);
+
+      for (const response of responses) {
+        const details = response?.videoDetails || {};
+        const micro = response?.microformat?.playerMicroformatRenderer || {};
+
+        if (videoId && details.videoId && details.videoId !== videoId) continue;
+
+        const channelId =
+          normalizeChannelId(details.channelId || micro.externalChannelId || micro.ownerChannelId || '');
+        const ownerUrl =
+          micro.ownerProfileUrl ||
+          micro.ownerProfileUrlPath ||
+          '';
+        const name =
+          cleanChannelDisplayName(details.author || micro.ownerChannelName || textFromRunsLike(micro.ownerText) || '');
+
+        if (channelId) {
+          return normalizeChannelInfo({
+            key: `channel:${channelId.toLowerCase()}`,
+            url: `/channel/${channelId}`,
+            channelId,
+            name: name || channelId,
+            nameKey: normalizeChannelName(name || channelId),
+            source: 'ytInitialPlayerResponse',
+            confidence: 'strong',
+          });
+        }
+
+        if (ownerUrl) {
+          const info = getChannelInfoFromUrl(ownerUrl, name);
+          if (info) {
+            info.source = 'ytInitialPlayerResponse.ownerProfileUrl';
+            info.confidence = 'strong';
+            info.aliases = getChannelAliases(info);
+            return info;
+          }
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
 
 
   function getVideoIdFromHref(href) {
@@ -2577,12 +2755,15 @@ html.${APP_ID}-fs-active body {
         const url = `/channel/${browseId}`;
         const displayName = cleanChannelDisplayName(fallbackName) || browseId;
 
-        return {
-          key: `url:${normalizeChannelPath(url)}`,
+        return normalizeChannelInfo({
+          key: `channel:${browseId.toLowerCase()}`,
           url,
+          channelId: browseId,
           name: displayName,
           nameKey: normalizeChannelName(displayName),
-        };
+          source: 'browseEndpoint',
+          confidence: 'strong',
+        });
       }
 
       if (browse?.url && /^\/(@|channel\/|c\/|user\/)/i.test(browse.url)) {
@@ -2696,14 +2877,26 @@ html.${APP_ID}-fs-active body {
       const videoId = getShortsVideoIdFromUrl();
       const root = getCurrentShortsRoot();
 
-      const fromDom = extractChannelInfo(root);
-      if (fromDom) return fromDom;
-
-      const fromDocument = extractChannelInfo(document);
-      if (fromDocument) return fromDocument;
+      /*
+        На активных Shorts сначала берём channelId из playerResponse.
+        Это самый ценный вариант: /channel/UC... переживает переименования,
+        переводы интерфейса и прочие человеческие попытки испортить данные.
+      */
+      const fromPlayer = extractChannelInfoFromPlayerResponse(videoId);
+      if (fromPlayer) return fromPlayer;
 
       const fromData = extractChannelInfoFromInitialData(videoId);
       if (fromData) return fromData;
+
+      const fromDom = extractChannelInfo(root);
+      if (fromDom) return fromDom;
+
+      /*
+        Документ целиком используем последним вариантом, потому что там могут лежать
+        ссылки на соседние Shorts, меню, рекомендации и прочий DOM-иллюзионизм.
+      */
+      const fromDocument = extractChannelInfo(document);
+      if (fromDocument) return fromDocument;
 
       return null;
     } catch {
@@ -2790,12 +2983,14 @@ html.${APP_ID}-fs-active body {
         if (candidate) {
           const key = normalizeChannelName(candidate);
 
-          return {
+          return normalizeChannelInfo({
             key: `name:${key}`,
             url: '',
             name: candidate,
             nameKey: key,
-          };
+            source: 'text-fallback',
+            confidence: 'weak',
+          });
         }
       }
 
@@ -2829,49 +3024,79 @@ html.${APP_ID}-fs-active body {
     const items = readBannedChannels();
     const map = new Map();
 
-    for (const item of items) {
-      if (item.key) map.set(item.key, item);
-      if (item.nameKey) map.set(`name:${item.nameKey}`, item);
-      if (item.url) map.set(`url:${normalizeChannelPath(item.url)}`, item);
+    for (const rawItem of items) {
+      const item = normalizeChannelInfo(rawItem) || rawItem;
+
+      getChannelAliases(item).forEach((alias) => {
+        map.set(alias, item);
+      });
     }
 
     return map;
   }
 
   function isChannelBanned(info, map = getBannedChannelMap()) {
-    if (!info) return false;
+    const normalized = normalizeChannelInfo(info);
+    if (!normalized) return false;
 
-    return Boolean(
-      map.has(info.key) ||
-        (info.nameKey && map.has(`name:${info.nameKey}`)) ||
-        (info.url && map.has(`url:${normalizeChannelPath(info.url)}`)),
-    );
+    return getChannelAliases(normalized).some((alias) => map.has(alias));
   }
 
-  function banChannel(info) {
+  function banChannel(info, meta = {}) {
     if (!CONFIG.channelFilterEnabled || !info) return false;
+
+    const normalized = normalizeChannelInfo(info);
+    if (!normalized || !normalized.key) return false;
+
+    if (CONFIG.shortsRequireStrongChannelForBan && !isStrongChannelInfo(normalized)) {
+      toast(`${APP_SHORT}: канал определён неточно`, 1200);
+      return false;
+    }
 
     const items = readBannedChannels();
     const map = getBannedChannelMap();
 
-    if (isChannelBanned(info, map)) {
-      toast(`${APP_SHORT}: канал уже скрыт`);
+    if (isChannelBanned(normalized, map)) {
+      toast(`${APP_SHORT}: канал уже в ЧС`, 950);
+
+      if (meta.videoId) {
+        const existing = map.get(getChannelAliases(normalized).find((alias) => map.has(alias)));
+        if (existing) {
+          existing.videoIds = Array.from(new Set([...(existing.videoIds || []), meta.videoId]));
+          writeBannedChannels(items);
+        }
+      }
+
       return true;
     }
 
     const item = {
-      key: info.key,
-      name: info.name || info.url || info.key,
-      nameKey: info.nameKey || normalizeChannelName(info.name),
-      url: info.url || '',
+      key: normalized.key,
+      keys: getChannelAliases(normalized),
+      aliases: getChannelAliases(normalized),
+      name: normalized.name || normalized.url || normalized.key,
+      nameKey: normalized.nameKey || normalizeChannelName(normalized.name),
+      url: normalized.url || '',
+      channelId: normalized.channelId || '',
+      handle: normalized.handle || '',
+      source: normalized.source || meta.source || '',
+      confidence: normalized.confidence || '',
+      videoIds: meta.videoId ? [meta.videoId] : [],
       bannedAt: new Date().toISOString(),
     };
 
     items.push(item);
     writeBannedChannels(items);
 
-    toast(`${APP_SHORT}: скрыт канал ${item.name}`, 1300);
+    state.lastBannedShortsVideoId = meta.videoId || '';
+    state.lastBannedShortsChannelKey = item.key || '';
+
+    toast(`${APP_SHORT}: канал в ЧС: ${item.name}`, 1300);
     scheduleChannelFilter('ban');
+
+    if (meta.source === 'shorts-button') {
+      scheduleBlockedShortsCheck('after-ban', CONFIG.shortsSkipBannedAfterBanDelayMs);
+    }
 
     return true;
   }
@@ -2879,19 +3104,28 @@ html.${APP_ID}-fs-active body {
   function unbanChannel(query) {
     const needle = normalizeChannelName(query);
     const pathNeedle = normalizeChannelPath(query);
+    const normalizedQuery = String(query || '').trim();
     const before = readBannedChannels();
 
-    const after = before.filter((item) => {
+    const after = before.filter((rawItem) => {
+      const item = normalizeChannelInfo(rawItem) || rawItem;
+      const aliases = getChannelAliases(item);
+
       return !(
-        item.key === query ||
+        item.key === normalizedQuery ||
+        aliases.includes(normalizedQuery) ||
+        aliases.includes(`name:${needle}`) ||
+        aliases.includes(`url:${pathNeedle}`) ||
         normalizeChannelName(item.name) === needle ||
         item.nameKey === needle ||
-        normalizeChannelPath(item.url) === pathNeedle
+        normalizeChannelPath(item.url) === pathNeedle ||
+        String(item.channelId || '').toLowerCase() === normalizedQuery.toLowerCase().replace(/^channel:/, '')
       );
     });
 
     writeBannedChannels(after);
     scheduleChannelFilter('unban');
+    scheduleBlockedShortsCheck('unban');
 
     return {
       removed: before.length - after.length,
@@ -3299,7 +3533,7 @@ html.${APP_ID}-fs-active body {
     return `${APP_SHORT}: ${parts.join(' + ')}`;
   }
 
-  async function sendShortsNegativeFeedback(info, reason = 'shorts') {
+  async function sendShortsNegativeFeedback(info, reason = 'shorts', options = {}) {
     if (!CONFIG.negativeFeedbackEnabled || !CONFIG.negativeFeedbackOnShortsBan) return null;
 
     const now = Date.now();
@@ -3313,7 +3547,7 @@ html.${APP_ID}-fs-active body {
       reason,
       type: 'shorts',
       channel: info?.name || info?.url || '',
-      videoId: getShortsVideoIdFromUrl(),
+      videoId: options.videoId || getShortsVideoIdFromUrl(),
       dislike: 'skipped',
       menu: 'skipped',
       at: new Date().toISOString(),
@@ -3450,7 +3684,10 @@ html.${APP_ID}-fs-active body {
             return;
           }
 
-          const didBan = banChannel(info);
+          const didBan = banChannel(info, {
+            source: 'card-button',
+            videoId: getVideoIdFromCard(currentCard),
+          });
           if (didBan && CONFIG.negativeFeedbackOnCardBan) {
             sendCardNegativeFeedback(currentCard, info, 'card-ban');
             setTimeout(() => hideChannelCard(currentCard, info), CONFIG.negativeFeedbackHideCardDelayMs);
@@ -3498,10 +3735,14 @@ html.${APP_ID}-fs-active body {
               return;
             }
 
-            const didBan = banChannel(info);
+            const shortsVideoId = getShortsVideoIdFromUrl();
+            const didBan = banChannel(info, {
+              source: 'shorts-button',
+              videoId: shortsVideoId,
+            });
 
             if (didBan) {
-              sendShortsNegativeFeedback(info, 'shorts-ban');
+              sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId });
             }
           },
           true,
@@ -3536,12 +3777,172 @@ html.${APP_ID}-fs-active body {
   }
 
 
+
+  function getCurrentShortsBannedInfo() {
+    if (!CONFIG.channelFilterEnabled || !isShortsPage()) return null;
+
+    const info = extractCurrentShortsChannelInfo();
+    if (!info) return null;
+
+    const normalized = normalizeChannelInfo(info);
+    const bannedMap = getBannedChannelMap();
+
+    if (!isChannelBanned(normalized, bannedMap)) return null;
+
+    const matchedAlias = getChannelAliases(normalized).find((alias) => bannedMap.has(alias)) || '';
+    const bannedItem = matchedAlias ? bannedMap.get(matchedAlias) : null;
+
+    return {
+      info: normalized,
+      matchedAlias,
+      bannedItem,
+      videoId: getShortsVideoIdFromUrl(),
+    };
+  }
+
+  function dispatchShortsSwipe(distancePx) {
+    try {
+      const startX = Math.round((window.innerWidth || 360) * 0.52);
+      const startY = Math.round((window.innerHeight || 640) * 0.72);
+      const endY = Math.max(40, startY - distancePx);
+      const target = getCurrentShortsRoot() || document.body || document.documentElement;
+
+      const common = {
+        bubbles: true,
+        cancelable: true,
+        pointerType: 'touch',
+        pointerId: 11,
+        isPrimary: true,
+        clientX: startX,
+      };
+
+      target.dispatchEvent(new PointerEvent('pointerdown', { ...common, clientY: startY }));
+      target.dispatchEvent(new PointerEvent('pointermove', { ...common, clientY: Math.round((startY + endY) / 2) }));
+      target.dispatchEvent(new PointerEvent('pointermove', { ...common, clientY: endY }));
+      target.dispatchEvent(new PointerEvent('pointerup', { ...common, clientY: endY }));
+
+      target.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true }));
+      target.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true }));
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function advanceToNextShort(reason = 'blocked') {
+    try {
+      const distance = CONFIG.shortsSkipGestureDistancePx || Math.round((window.innerHeight || 640) * 0.66);
+
+      const swiped = dispatchShortsSwipe(distance);
+
+      try {
+        window.scrollBy({
+          top: Math.round((window.innerHeight || 640) * 0.92),
+          left: 0,
+          behavior: 'smooth',
+        });
+      } catch {
+        window.scrollBy(0, Math.round((window.innerHeight || 640) * 0.92));
+      }
+
+      try {
+        document.dispatchEvent(new WheelEvent('wheel', {
+          bubbles: true,
+          cancelable: true,
+          deltaY: Math.round((window.innerHeight || 640) * 0.9),
+          deltaMode: 0,
+        }));
+      } catch {}
+
+      log('advance to next short', { reason, swiped });
+      return true;
+    } catch (error) {
+      log('advance short failed', error);
+      return false;
+    }
+  }
+
+  function processBlockedShorts(reason = 'blocked-check') {
+    if (!CONFIG.shortsSkipBannedChannelsEnabled || !isShortsPage()) return null;
+
+    try {
+      const now = Date.now();
+
+      if (now - state.lastBlockedShortsSkipAtMs < CONFIG.shortsSkipBannedCooldownMs) {
+        return state.lastBlockedShortsResult;
+      }
+
+      const blocked = getCurrentShortsBannedInfo();
+
+      if (!blocked) {
+        state.lastBlockedShortsResult = {
+          status: 'not-banned',
+          reason,
+          videoId: getShortsVideoIdFromUrl(),
+          at: new Date().toISOString(),
+        };
+
+        return state.lastBlockedShortsResult;
+      }
+
+      if (blocked.videoId && blocked.videoId === state.lastBlockedShortsVideoId) {
+        return state.lastBlockedShortsResult;
+      }
+
+      const skipped = advanceToNextShort(reason);
+
+      state.lastBlockedShortsSkipAtMs = now;
+      state.lastBlockedShortsVideoId = blocked.videoId || '';
+      state.lastBlockedShortsResult = {
+        status: skipped ? 'skipped' : 'skip-failed',
+        reason,
+        videoId: blocked.videoId || '',
+        channel: blocked.info?.name || blocked.info?.url || blocked.info?.key || '',
+        matchedAlias: blocked.matchedAlias || '',
+        at: new Date().toISOString(),
+      };
+
+      if (skipped) {
+        toast(`${APP_SHORT}: Shorts из ЧС пропущен`, 850);
+      }
+
+      return state.lastBlockedShortsResult;
+    } catch (error) {
+      state.lastBlockedShortsResult = {
+        status: 'error',
+        reason,
+        error: String(error && error.message ? error.message : error),
+        at: new Date().toISOString(),
+      };
+
+      return state.lastBlockedShortsResult;
+    }
+  }
+
+  function scheduleBlockedShortsCheck(reason = 'scheduled', delay = CONFIG.shortsSkipBannedDelayMs) {
+    if (!CONFIG.shortsSkipBannedChannelsEnabled) return;
+
+    clearTimeout(state.blockedShortsTimer);
+    state.blockedShortsTimer = setTimeout(() => processBlockedShorts(reason), delay);
+  }
+
+  window.cuCheckCurrentShortsBan = function cuCheckCurrentShortsBan() {
+    return {
+      current: getCurrentShortsBannedInfo(),
+      result: processBlockedShorts('manual-console'),
+      banned: readBannedChannels(),
+    };
+  };
+
+
   function processChannelCards(reason = 'process') {
     if (!CONFIG.channelFilterEnabled) return;
 
     try {
       ensureChannelFilterStyle();
       syncShortsBanButton();
+      scheduleBlockedShortsCheck(reason);
 
       const cards = Array.from(document.querySelectorAll(getChannelCardSelector()));
       const bannedMap = getBannedChannelMap();
@@ -3627,6 +4028,7 @@ html.${APP_ID}-fs-active body {
     syncFullscreenSoon(reason);
     scheduleHomeChipsCleanup(reason);
     scheduleChannelFilter(reason);
+    scheduleBlockedShortsCheck(reason);
   }
 
   function installRouteWatchers() {
@@ -3664,6 +4066,7 @@ html.${APP_ID}-fs-active body {
         scheduleBind();
         scheduleHomeChipsCleanup('mutation');
         scheduleChannelFilter('mutation');
+        scheduleBlockedShortsCheck('mutation');
 
         if (location.href !== state.currentUrl) {
           onUrlMaybeChanged('mutation-url');
@@ -3687,7 +4090,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.4',
+      version: '0.3.5',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -3723,6 +4126,9 @@ html.${APP_ID}-fs-active body {
       sourceShortsPage: isSourceShortsPage(),
       currentShortsVideoId: getShortsVideoIdFromUrl(),
       currentShortsChannel: extractCurrentShortsChannelInfo(),
+      currentShortsBannedInfo: getCurrentShortsBannedInfo(),
+      shortsSkipBannedChannelsEnabled: CONFIG.shortsSkipBannedChannelsEnabled,
+      lastBlockedShortsResult: state.lastBlockedShortsResult,
       bannedChannelsCount: readBannedChannels().length,
       channelBanButtonText: CONFIG.channelBanButtonText,
       channelBanButtons: document.querySelectorAll(`.${APP_ID}-channel-ban-button`).length,
@@ -3759,6 +4165,7 @@ html.${APP_ID}-fs-active body {
     syncFullscreenSoon('init');
     scheduleHomeChipsCleanup('init');
     scheduleChannelFilter('init');
+    scheduleBlockedShortsCheck('init');
 
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
@@ -3768,6 +4175,7 @@ html.${APP_ID}-fs-active body {
         syncCustomControls('visibility');
         scheduleHomeChipsCleanup('visibility');
         scheduleChannelFilter('visibility');
+        scheduleBlockedShortsCheck('visibility');
       }
     });
   }
