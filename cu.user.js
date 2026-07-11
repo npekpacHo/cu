@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, verified Shorts feed blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, race-safe Shorts blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.8
+// @version      0.3.9
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -258,6 +258,17 @@
     shortsRequireStrongChannelForBan: false,
     channelBanVerifyAfterClick: true,
 
+    /*
+      0.3.9:
+      защита от гонки при быстром свайпе Shorts.
+      YouTube может уже показать новый DOM, но держать старый playerResponse.
+      В этот момент банить/автопропускать нельзя: можно попасть не в тот канал.
+    */
+    shortsIdentityRaceGuardEnabled: true,
+    shortsIdentityRaceDelayMs: 150,
+    shortsIdentityMismatchGraceMs: 260,
+    shortsIdentityMaxDeferredAttempts: 2,
+
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
     doubleTapMaxDelayMs: 360,
@@ -309,6 +320,9 @@
     lastBannedShortsChannelKey: '',
     lastBlockedShortsResult: null,
     lastPoopActionResult: null,
+    shortsIdentityMismatchSinceMs: 0,
+    shortsIdentityDeferredAttempts: 0,
+    lastShortsIdentityStatus: null,
     negativeFeedbackBusyUntilMs: 0,
     lastNegativeFeedbackResult: null,
     observer: null,
@@ -488,18 +502,48 @@
     }
   }
 
+  function getCurrentShortsVideoIdParts(root = null) {
+    try {
+      const activeRoot = root || getCurrentShortsRoot?.() || document;
+      const url = getShortsVideoIdFromUrl();
+      const dom = getVideoIdFromShortsLinks(activeRoot) || getVideoIdFromShortsLinks(document);
+      const player = getVideoIdFromPlayerResponse();
+      const strong = url || dom || '';
+      const chosen = strong || player || '';
+      const hasMismatch = Boolean(strong && player && strong !== player);
+
+      return {
+        url,
+        dom,
+        player,
+        strong,
+        chosen,
+        hasMismatch,
+        mismatch: hasMismatch ? `${strong} != ${player}` : '',
+        source: url ? 'url' : dom ? 'dom' : player ? 'player' : '',
+        at: Date.now(),
+      };
+    } catch {
+      return {
+        url: '',
+        dom: '',
+        player: '',
+        strong: '',
+        chosen: '',
+        hasMismatch: false,
+        mismatch: '',
+        source: '',
+        at: Date.now(),
+      };
+    }
+  }
+
   function getCurrentShortsVideoId() {
     /*
       На `/shorts/<id>` всё просто. На общей ленте `/shorts/` URL пустой,
       поэтому вытаскиваем id из активного DOM, canonical/og или playerResponse.
     */
-    return (
-      getShortsVideoIdFromUrl() ||
-      getVideoIdFromShortsLinks(getCurrentShortsRoot?.() || document) ||
-      getVideoIdFromShortsLinks(document) ||
-      getVideoIdFromPlayerResponse() ||
-      ''
-    );
+    return getCurrentShortsVideoIdParts().chosen || '';
   }
 
   function isShortsPage() {
@@ -3170,10 +3214,80 @@ html.${APP_ID}-fs-active body {
     }
   }
 
+
+  function getShortsIdentityDecision(parts = getCurrentShortsVideoIdParts(), reason = 'decision') {
+    const now = Date.now();
+
+    if (!CONFIG.shortsIdentityRaceGuardEnabled || !isShortsPage()) {
+      state.lastShortsIdentityStatus = {
+        reason,
+        status: 'disabled-or-not-shorts',
+        parts,
+        delayMs: 0,
+        at: new Date().toISOString(),
+      };
+
+      return state.lastShortsIdentityStatus;
+    }
+
+    if (!parts.hasMismatch) {
+      state.shortsIdentityMismatchSinceMs = 0;
+      state.shortsIdentityDeferredAttempts = 0;
+      state.lastShortsIdentityStatus = {
+        reason,
+        status: 'stable',
+        parts,
+        delayMs: 0,
+        at: new Date().toISOString(),
+      };
+
+      return state.lastShortsIdentityStatus;
+    }
+
+    if (!state.shortsIdentityMismatchSinceMs) {
+      state.shortsIdentityMismatchSinceMs = now;
+      state.shortsIdentityDeferredAttempts = 0;
+    }
+
+    const mismatchAgeMs = now - state.shortsIdentityMismatchSinceMs;
+    const shouldDelay =
+      mismatchAgeMs < CONFIG.shortsIdentityMismatchGraceMs &&
+      state.shortsIdentityDeferredAttempts < CONFIG.shortsIdentityMaxDeferredAttempts;
+
+    if (shouldDelay) {
+      state.shortsIdentityDeferredAttempts += 1;
+    }
+
+    state.lastShortsIdentityStatus = {
+      reason,
+      status: shouldDelay ? 'wait-mismatch' : 'proceed-ignore-player',
+      parts,
+      mismatchAgeMs,
+      deferredAttempts: state.shortsIdentityDeferredAttempts,
+      delayMs: shouldDelay ? CONFIG.shortsIdentityRaceDelayMs : 0,
+      at: new Date().toISOString(),
+    };
+
+    return state.lastShortsIdentityStatus;
+  }
+
+  function isPlayerResponseSafeForShorts(parts = getCurrentShortsVideoIdParts()) {
+    if (!parts.hasMismatch) return true;
+
+    /*
+      Если DOM/URL говорит одно, а playerResponse другое, playerResponse старый.
+      Его нельзя использовать для канала, иначе какашка отправит в канализацию
+      не того автора. Было бы смешно, если бы не было так похоже на продуктовую аналитику.
+    */
+    return false;
+  }
+
+
   function extractCurrentShortsChannelInfo() {
     try {
-      const videoId = getCurrentShortsVideoId();
       const root = getCurrentShortsRoot();
+      const parts = getCurrentShortsVideoIdParts(root);
+      const videoId = parts.chosen;
 
       /*
         `/shorts/<id>`: playerResponse обычно самый надёжный.
@@ -3186,8 +3300,10 @@ html.${APP_ID}-fs-active body {
         return fromDom;
       }
 
-      const fromPlayer = extractChannelInfoFromPlayerResponse(videoId);
-      if (fromPlayer) return fromPlayer;
+      if (isPlayerResponseSafeForShorts(parts)) {
+        const fromPlayer = extractChannelInfoFromPlayerResponse(videoId);
+        if (fromPlayer) return fromPlayer;
+      }
 
       const fromData = extractChannelInfoFromInitialData(videoId);
       if (fromData) return fromData;
@@ -3385,6 +3501,8 @@ html.${APP_ID}-fs-active body {
       aliases: check.aliases || [],
       matchedAliases: check.matchedAliases || [],
       matchedItem: check.matchedItem || null,
+      identity: meta.identity || getCurrentShortsVideoIdParts(),
+      identityDecision: meta.identityDecision || state.lastShortsIdentityStatus,
       feedback: state.lastNegativeFeedbackResult,
       at: new Date().toISOString(),
     };
@@ -4114,6 +4232,66 @@ html.${APP_ID}-fs-active body {
     }
   }
 
+
+  function handleShortsPoopAction(reason = 'shorts-button') {
+    try {
+      const parts = getCurrentShortsVideoIdParts();
+      const decision = getShortsIdentityDecision(parts, reason);
+
+      if (decision.status === 'wait-mismatch') {
+        toast(`${APP_SHORT}: жду Shorts…`, 650);
+
+        setTimeout(() => {
+          handleShortsPoopAction(`${reason}-stable`);
+        }, decision.delayMs || CONFIG.shortsIdentityRaceDelayMs);
+
+        return false;
+      }
+
+      const info = extractCurrentShortsChannelInfo();
+
+      if (!info) {
+        toast(`${APP_SHORT}: не нашёл канал Shorts`, 1200);
+        return false;
+      }
+
+      const shortsVideoId = getCurrentShortsVideoId();
+      const didBan = banChannel(info, {
+        source: 'shorts-button',
+        videoId: shortsVideoId,
+      });
+
+      const poopMeta = {
+        source: 'shorts-button',
+        videoId: shortsVideoId,
+        identity: getCurrentShortsVideoIdParts(),
+        identityDecision: decision,
+      };
+
+      recordPoopAction(info, poopMeta, didBan);
+
+      if (didBan) {
+        sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId })
+          .then(() => recordPoopAction(info, poopMeta, didBan))
+          .catch(() => recordPoopAction(info, poopMeta, didBan));
+
+        if (CONFIG.shortsAdvanceAfterPoopEnabled) {
+          setTimeout(() => {
+            advanceToNextShort('after-poop');
+            scheduleBlockedShortsCheck('after-poop-check', CONFIG.shortsSkipBannedDelayMs);
+          }, CONFIG.shortsAdvanceAfterPoopDelayMs);
+        }
+      }
+
+      return didBan;
+    } catch (error) {
+      log('poop action failed:', error);
+      toast(`${APP_SHORT}: 💩 не сработала`, 1100);
+      return false;
+    }
+  }
+
+
   function createShortsBanSlot() {
     const slot = document.createElement('div');
     slot.className = `${APP_ID}-shorts-ban-slot ytwReelActionBarViewModelHostDesktopActionButton`;
@@ -4139,38 +4317,7 @@ html.${APP_ID}-fs-active body {
         event.stopPropagation();
         if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
 
-        const info = extractCurrentShortsChannelInfo();
-
-        if (!info) {
-          toast(`${APP_SHORT}: не нашёл канал Shorts`, 1200);
-          return;
-        }
-
-        const shortsVideoId = getCurrentShortsVideoId();
-        const didBan = banChannel(info, {
-          source: 'shorts-button',
-          videoId: shortsVideoId,
-        });
-
-        const poopMeta = {
-          source: 'shorts-button',
-          videoId: shortsVideoId,
-        };
-
-        recordPoopAction(info, poopMeta, didBan);
-
-        if (didBan) {
-          sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId })
-            .then(() => recordPoopAction(info, poopMeta, didBan))
-            .catch(() => recordPoopAction(info, poopMeta, didBan));
-
-          if (CONFIG.shortsAdvanceAfterPoopEnabled) {
-            setTimeout(() => {
-              advanceToNextShort('after-poop');
-              scheduleBlockedShortsCheck('after-poop-check', CONFIG.shortsSkipBannedDelayMs);
-            }, CONFIG.shortsAdvanceAfterPoopDelayMs);
-          }
-        }
+        handleShortsPoopAction('shorts-button');
       },
       true,
     );
@@ -4447,6 +4594,22 @@ html.${APP_ID}-fs-active body {
         return state.lastBlockedShortsResult;
       }
 
+      const identityParts = getCurrentShortsVideoIdParts();
+      const identityDecision = getShortsIdentityDecision(identityParts, reason);
+
+      if (identityDecision.status === 'wait-mismatch') {
+        state.lastBlockedShortsResult = {
+          status: 'waiting-identity',
+          reason,
+          identityDecision,
+          videoId: identityParts.chosen || '',
+          at: new Date().toISOString(),
+        };
+
+        scheduleBlockedShortsCheck(`${reason}-stable`, identityDecision.delayMs || CONFIG.shortsIdentityRaceDelayMs);
+        return state.lastBlockedShortsResult;
+      }
+
       const blocked = getCurrentShortsBannedInfo();
 
       if (!blocked) {
@@ -4666,7 +4829,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.8',
+      version: '0.3.9',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -4706,8 +4869,11 @@ html.${APP_ID}-fs-active body {
       shortsPage: isShortsPage(),
       sourceShortsPage: isSourceShortsPage(),
       currentShortsVideoId: getCurrentShortsVideoId(),
+      currentShortsVideoIdParts: getCurrentShortsVideoIdParts(),
       currentShortsVideoIdFromUrl: getShortsVideoIdFromUrl(),
       currentShortsVideoIdFromPlayer: getVideoIdFromPlayerResponse(),
+      shortsIdentityRaceGuardEnabled: CONFIG.shortsIdentityRaceGuardEnabled,
+      lastShortsIdentityStatus: state.lastShortsIdentityStatus,
       currentShortsChannel: extractCurrentShortsChannelInfo(),
       currentShortsBannedInfo: getCurrentShortsBannedInfo(),
       currentShortsBlacklistCheck: getChannelBanCheck(extractCurrentShortsChannelInfo()),
