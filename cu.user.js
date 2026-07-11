@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, reliable Shorts feed blacklist, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, надёжный ЧС каналов общей Shorts-ленты, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, verified Shorts feed blacklist, synced volume, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, проверяемый ЧС каналов Shorts, синхронная громкость, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.6
+// @version      0.3.7
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -151,6 +151,17 @@
     volumeApplyStoredOnBind: true,
 
     /*
+      0.3.7:
+      громкость должна быть одна на обычных видео и Shorts.
+      YouTube любит плодить несколько <video>, а потом один из них внезапно орёт
+      громче остальных, как будто у него отдельный договор с соседями.
+    */
+    volumeSyncAllVideos: true,
+    volumeSyncAllVideosOnMutation: true,
+    volumeSyncForceOnPlay: true,
+    volumeSyncDebounceMs: 160,
+
+    /*
       Для своих кнопок fullscreen стараемся делать на контейнер плеера, а не на <video>.
       Если fullscreen-ить само видео, DOM-кнопки поверх него могут не отображаться вообще.
     */
@@ -242,6 +253,7 @@
     shortsAdvanceAfterPoopEnabled: true,
     shortsAdvanceAfterPoopDelayMs: 520,
     shortsRequireStrongChannelForBan: false,
+    channelBanVerifyAfterClick: true,
 
     doubleTapSeekEnabled: true,
     doubleTapSeekSeconds: 10,
@@ -273,6 +285,10 @@
     customControlsEl: null,
     customControlsHideTimer: 0,
     volumeAppliedVideo: null,
+    volumeAppliedVideos: new WeakSet(),
+    volumeSyncTimer: 0,
+    volumeInternalChangeUntilMs: 0,
+    lastVolumeSyncResult: null,
     volumeSliderEl: null,
     volumeTrackEl: null,
     volumeActiveTrackEl: null,
@@ -289,6 +305,7 @@
     lastBannedShortsVideoId: '',
     lastBannedShortsChannelKey: '',
     lastBlockedShortsResult: null,
+    lastPoopActionResult: null,
     negativeFeedbackBusyUntilMs: 0,
     lastNegativeFeedbackResult: null,
     observer: null,
@@ -311,8 +328,62 @@
     if (CONFIG.debug) console.log(`[${APP_SHORT}]`, ...args);
   };
 
+  function getAllVideos() {
+    try {
+      return Array.from(document.querySelectorAll('video')).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  function getVideoVisibilityScore(video) {
+    try {
+      if (!video || !video.getBoundingClientRect) return -9999;
+
+      const rect = video.getBoundingClientRect();
+      const vw = window.innerWidth || document.documentElement.clientWidth || 360;
+      const vh = window.innerHeight || document.documentElement.clientHeight || 640;
+
+      const visibleWidth = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+      const visibleHeight = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+      const visibleArea = visibleWidth * visibleHeight;
+      const totalArea = Math.max(1, rect.width * rect.height);
+      const visibleRatio = visibleArea / totalArea;
+
+      let score = 0;
+
+      if (visibleArea > 4000) score += 30;
+      score += Math.min(40, visibleArea / 12000);
+      score += visibleRatio * 25;
+
+      if (!video.paused) score += 55;
+      if (!video.ended) score += 5;
+      if (video.readyState >= 2) score += 8;
+      if (video.currentSrc || video.src) score += 5;
+      if (video.classList?.contains('html5-main-video')) score += 8;
+
+      if (isShortsPage()) {
+        if (rect.height > vh * 0.45) score += 25;
+        if (Math.abs((rect.top + rect.bottom) / 2 - vh / 2) < vh * 0.35) score += 20;
+      }
+
+      if (rect.width <= 1 || rect.height <= 1) score -= 80;
+
+      return score;
+    } catch {
+      return 0;
+    }
+  }
+
   function getVideo() {
-    return document.querySelector('video.html5-main-video, video');
+    const videos = getAllVideos();
+
+    if (!videos.length) return null;
+    if (videos.length === 1) return videos[0];
+
+    return videos
+      .map((video) => ({ video, score: getVideoVisibilityScore(video) }))
+      .sort((a, b) => b.score - a.score)[0]?.video || videos[0];
   }
 
   function getPlayer() {
@@ -799,7 +870,8 @@
     }
 
     state.boundVideo = video;
-    applyStoredVolume(video);
+    applyStoredVolume(video, true);
+    syncStoredVolumeToAllVideos('bind-video', true);
 
     video.addEventListener('timeupdate', runSkipCheck, { passive: true });
     video.addEventListener('seeking', runSkipCheck, { passive: true });
@@ -821,13 +893,17 @@
   }
 
   function onVideoMetadata() {
-    applyStoredVolume(getVideo());
+    applyStoredVolume(getVideo(), true);
+    syncStoredVolumeToAllVideos('metadata', true);
     updateVolumeControl();
     scheduleRefresh('metadata');
     syncFullscreenSoon('metadata');
   }
 
   function onVideoPlay() {
+    if (CONFIG.volumeSyncForceOnPlay) {
+      syncStoredVolumeToAllVideos('play', true);
+    }
     updateVolumeControl();
     scheduleRefresh('play');
     syncFullscreenSoon('play');
@@ -1562,9 +1638,100 @@ html.${APP_ID}-fs-active body {
     }
   }
 
-  function applyStoredVolume(video = getVideo()) {
+
+  function setSingleVideoVolume(video, percent) {
+    if (!video) return false;
+
+    const normalized = normalizeVolumePercent(percent);
+    const volume = normalized / 100;
+
+    try {
+      state.volumeInternalChangeUntilMs = Date.now() + 350;
+
+      video.volume = volume;
+      video.muted = normalized <= 0;
+
+      if (normalized > 0 && video.muted) {
+        video.muted = false;
+      }
+
+      state.volumeAppliedVideos.add(video);
+      return true;
+    } catch (error) {
+      log('single video volume failed:', error);
+      return false;
+    }
+  }
+
+  function getVideosForVolumeSync() {
+    const videos = CONFIG.volumeSyncAllVideos ? getAllVideos() : [getVideo()];
+
+    return Array.from(new Set(videos.filter(Boolean)));
+  }
+
+  function syncStoredVolumeToAllVideos(reason = 'sync', force = false) {
+    if (!CONFIG.volumeControlEnabled || !CONFIG.volumeApplyStoredOnBind) return false;
+
+    const stored = readStoredVolumePercent();
+    if (stored === null) return false;
+
+    const videos = getVideosForVolumeSync();
+    let changed = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const video of videos) {
+      try {
+        const current = getVideoVolumePercent(video);
+        const alreadyApplied = state.volumeAppliedVideos.has(video);
+        const needsSync =
+          force ||
+          !alreadyApplied ||
+          Math.abs(current - stored) >= 1 ||
+          (stored > 0 && video.muted);
+
+        if (!needsSync) {
+          skipped += 1;
+          continue;
+        }
+
+        if (setSingleVideoVolume(video, stored)) {
+          changed += 1;
+        } else {
+          errors += 1;
+        }
+      } catch {
+        errors += 1;
+      }
+    }
+
+    state.lastVolumeSyncResult = {
+      reason,
+      stored,
+      videos: videos.length,
+      changed,
+      skipped,
+      errors,
+      activeVolume: getVideoVolumePercent(getVideo()),
+      at: new Date().toISOString(),
+    };
+
+    updateVolumeControl();
+
+    log('volume sync all', state.lastVolumeSyncResult);
+    return changed > 0 || videos.length > 0;
+  }
+
+  function scheduleVolumeSync(reason = 'scheduled', force = false, delay = CONFIG.volumeSyncDebounceMs) {
+    if (!CONFIG.volumeControlEnabled || !CONFIG.volumeSyncAllVideosOnMutation) return;
+
+    clearTimeout(state.volumeSyncTimer);
+    state.volumeSyncTimer = setTimeout(() => syncStoredVolumeToAllVideos(reason, force), delay);
+  }
+
+
+  function applyStoredVolume(video = getVideo(), force = false) {
     if (!CONFIG.volumeControlEnabled || !CONFIG.volumeApplyStoredOnBind || !video) return false;
-    if (state.volumeAppliedVideo === video) return true;
 
     const stored = readStoredVolumePercent();
 
@@ -1575,33 +1742,58 @@ html.${APP_ID}-fs-active body {
     if (stored === null) {
       writeStoredVolumePercent(getVideoVolumePercent(video));
       state.volumeAppliedVideo = video;
+      state.volumeAppliedVideos.add(video);
       return false;
     }
 
-    setVideoVolumePercent(stored, 'stored', false);
+    if (!force && state.volumeAppliedVideos.has(video) && Math.abs(getVideoVolumePercent(video) - stored) < 1) {
+      state.volumeAppliedVideo = video;
+      return true;
+    }
+
+    const ok = setSingleVideoVolume(video, stored);
+
     state.volumeAppliedVideo = video;
-    return true;
+
+    if (CONFIG.volumeSyncAllVideos) {
+      syncStoredVolumeToAllVideos('apply-stored', force);
+    }
+
+    return ok;
   }
 
   function setVideoVolumePercent(percent, reason = 'manual', save = true) {
-    const video = getVideo();
-    if (!video) return false;
-
     const normalized = normalizeVolumePercent(percent);
+    const videos = getVideosForVolumeSync();
+
+    if (!videos.length) return false;
+
+    let changed = 0;
+    let errors = 0;
 
     try {
-      const volume = normalized / 100;
-
-      video.volume = volume;
-      video.muted = normalized <= 0;
-
-      if (normalized > 0 && video.muted) {
-        video.muted = false;
+      for (const video of videos) {
+        if (setSingleVideoVolume(video, normalized)) {
+          changed += 1;
+        } else {
+          errors += 1;
+        }
       }
 
       if (save) {
         writeStoredVolumePercent(normalized);
       }
+
+      state.lastVolumeSyncResult = {
+        reason,
+        stored: normalized,
+        videos: videos.length,
+        changed,
+        skipped: 0,
+        errors,
+        activeVolume: getVideoVolumePercent(getVideo()),
+        at: new Date().toISOString(),
+      };
 
       updateVolumeControl();
 
@@ -1609,8 +1801,8 @@ html.${APP_ID}-fs-active body {
         toast(`${APP_SHORT}: громкость ${Math.round(normalized)}%`, 650);
       }
 
-      log('volume set', { reason, percent: normalized });
-      return true;
+      log('volume set', state.lastVolumeSyncResult);
+      return changed > 0;
     } catch (error) {
       log('volume set failed:', error);
       return false;
@@ -3114,6 +3306,81 @@ html.${APP_ID}-fs-active body {
     return getChannelAliases(normalized).some((alias) => map.has(alias));
   }
 
+
+  function getChannelBanCheck(info) {
+    const normalized = normalizeChannelInfo(info);
+    const map = getBannedChannelMap();
+
+    if (!normalized) {
+      return {
+        banned: false,
+        info: null,
+        aliases: [],
+        matchedAliases: [],
+        matchedItem: null,
+      };
+    }
+
+    const aliases = getChannelAliases(normalized);
+    const matchedAliases = aliases.filter((alias) => map.has(alias));
+    const matchedItem = matchedAliases.length ? map.get(matchedAliases[0]) : null;
+
+    return {
+      banned: matchedAliases.length > 0,
+      info: normalized,
+      aliases,
+      matchedAliases,
+      matchedItem: matchedItem || null,
+    };
+  }
+
+  function recordPoopAction(info, meta = {}, didBan = false) {
+    const check = getChannelBanCheck(info);
+
+    state.lastPoopActionResult = {
+      ok: Boolean(didBan && check.banned),
+      didBan: Boolean(didBan),
+      banConfirmed: Boolean(check.banned),
+      videoId: meta.videoId || getCurrentShortsVideoId(),
+      channel: check.info || normalizeChannelInfo(info),
+      aliases: check.aliases || [],
+      matchedAliases: check.matchedAliases || [],
+      matchedItem: check.matchedItem || null,
+      feedback: state.lastNegativeFeedbackResult,
+      at: new Date().toISOString(),
+    };
+
+    if (CONFIG.channelBanVerifyAfterClick && didBan) {
+      if (check.banned) {
+        log('poop ban confirmed', state.lastPoopActionResult);
+      } else {
+        toast(`${APP_SHORT}: ЧС не подтвердился`, 1300);
+        log('poop ban NOT confirmed', state.lastPoopActionResult);
+      }
+    }
+
+    return state.lastPoopActionResult;
+  }
+
+  window.cuLastPoop = function cuLastPoop() {
+    return state.lastPoopActionResult;
+  };
+
+  window.cuVerifyCurrentShortsBlacklist = function cuVerifyCurrentShortsBlacklist() {
+    const info = extractCurrentShortsChannelInfo();
+    const check = getChannelBanCheck(info);
+
+    return {
+      currentVideoId: getCurrentShortsVideoId(),
+      currentChannel: normalizeChannelInfo(info),
+      check,
+      lastPoop: state.lastPoopActionResult,
+      lastBlockedShortsResult: state.lastBlockedShortsResult,
+      banned: readBannedChannels(),
+    };
+  };
+
+
   function banChannel(info, meta = {}) {
     if (!CONFIG.channelFilterEnabled || !info) return false;
 
@@ -3760,6 +4027,11 @@ html.${APP_ID}-fs-active body {
             source: 'card-button',
             videoId: getVideoIdFromCard(currentCard),
           });
+          recordPoopAction(info, {
+            source: 'card-button',
+            videoId: getVideoIdFromCard(currentCard),
+          }, didBan);
+
           if (didBan && CONFIG.negativeFeedbackOnCardBan) {
             sendCardNegativeFeedback(currentCard, info, 'card-ban');
             setTimeout(() => hideChannelCard(currentCard, info), CONFIG.negativeFeedbackHideCardDelayMs);
@@ -3813,8 +4085,17 @@ html.${APP_ID}-fs-active body {
               videoId: shortsVideoId,
             });
 
+            const poopMeta = {
+              source: 'shorts-button',
+              videoId: shortsVideoId,
+            };
+
+            recordPoopAction(info, poopMeta, didBan);
+
             if (didBan) {
-              sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId });
+              sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId })
+                .then(() => recordPoopAction(info, poopMeta, didBan))
+                .catch(() => recordPoopAction(info, poopMeta, didBan));
 
               if (CONFIG.shortsAdvanceAfterPoopEnabled) {
                 setTimeout(() => {
@@ -3863,18 +4144,15 @@ html.${APP_ID}-fs-active body {
     const info = extractCurrentShortsChannelInfo();
     if (!info) return null;
 
-    const normalized = normalizeChannelInfo(info);
-    const bannedMap = getBannedChannelMap();
+    const check = getChannelBanCheck(info);
 
-    if (!isChannelBanned(normalized, bannedMap)) return null;
-
-    const matchedAlias = getChannelAliases(normalized).find((alias) => bannedMap.has(alias)) || '';
-    const bannedItem = matchedAlias ? bannedMap.get(matchedAlias) : null;
+    if (!check.banned) return null;
 
     return {
-      info: normalized,
-      matchedAlias,
-      bannedItem,
+      info: check.info,
+      matchedAlias: check.matchedAliases[0] || '',
+      matchedAliases: check.matchedAliases || [],
+      bannedItem: check.matchedItem || null,
       videoId: getCurrentShortsVideoId(),
     };
   }
@@ -4186,6 +4464,7 @@ html.${APP_ID}-fs-active body {
     syncShortsBanButton();
 
     scheduleBind();
+    scheduleVolumeSync(reason, true);
     scheduleRefresh(reason);
     syncFullscreenSoon(reason);
     scheduleHomeChipsCleanup(reason);
@@ -4226,6 +4505,7 @@ html.${APP_ID}-fs-active body {
 
       state.observer = new MutationObserver(() => {
         scheduleBind();
+        scheduleVolumeSync('mutation');
         scheduleHomeChipsCleanup('mutation');
         scheduleChannelFilter('mutation');
         scheduleBlockedShortsCheck('mutation');
@@ -4252,7 +4532,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.6',
+      version: '0.3.7',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -4271,6 +4551,11 @@ html.${APP_ID}-fs-active body {
       volumeControlEnabled: CONFIG.volumeControlEnabled,
       volumePercent: getVideoVolumePercent(video),
       storedVolumePercent: readStoredVolumePercent(),
+      volumeSyncAllVideos: CONFIG.volumeSyncAllVideos,
+      videosCount: getAllVideos().length,
+      activeVideoVolumePercent: getVideoVolumePercent(getVideo()),
+      storedVolumePercentNow: readStoredVolumePercent(),
+      lastVolumeSyncResult: state.lastVolumeSyncResult,
       hasVolumeSlider: Boolean(state.volumeSliderEl),
       hasVolumeTrack: Boolean(state.volumeActiveTrackEl),
       volumeTrackActiveWidth: state.volumeActiveTrackEl ? state.volumeActiveTrackEl.style.width : '',
@@ -4291,6 +4576,8 @@ html.${APP_ID}-fs-active body {
       currentShortsVideoIdFromPlayer: getVideoIdFromPlayerResponse(),
       currentShortsChannel: extractCurrentShortsChannelInfo(),
       currentShortsBannedInfo: getCurrentShortsBannedInfo(),
+      currentShortsBlacklistCheck: getChannelBanCheck(extractCurrentShortsChannelInfo()),
+      lastPoopActionResult: state.lastPoopActionResult,
       shortsSkipBannedChannelsEnabled: CONFIG.shortsSkipBannedChannelsEnabled,
       shortsAdvanceAfterPoopEnabled: CONFIG.shortsAdvanceAfterPoopEnabled,
       lastBlockedShortsResult: state.lastBlockedShortsResult,
@@ -4326,6 +4613,7 @@ html.${APP_ID}-fs-active body {
     installMutationObserver();
 
     scheduleBind();
+    scheduleVolumeSync('init', true);
     scheduleRefresh('init');
     syncFullscreenSoon('init');
     scheduleHomeChipsCleanup('init');
@@ -4338,6 +4626,7 @@ html.${APP_ID}-fs-active body {
         scheduleRefresh('visibility');
         syncFullscreenSoon('visibility');
         syncCustomControls('visibility');
+        scheduleVolumeSync('visibility', true);
         scheduleHomeChipsCleanup('visibility');
         scheduleChannelFilter('visibility');
         scheduleBlockedShortsCheck('visibility');
