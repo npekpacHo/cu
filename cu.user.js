@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, verified Shorts feed blacklist, synced volume, safe negative Shorts feedback, poop ban button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, проверяемый ЧС каналов Shorts, синхронная громкость, безопасный негативный feedback по Shorts, какашечная кнопка бана, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, verified Shorts feed blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.7
+// @version      0.3.8
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -210,6 +210,9 @@
     shortsBanButtonFontPx: 34,
     shortsBanButtonRightPx: 12,
     shortsBanButtonTopPx: 74,
+    shortsBanButtonPreferActionBar: true,
+    shortsBanButtonActionBarLabel: 'ЧС',
+    shortsBanButtonFallbackFixed: true,
     hideBanButtonOnMainWatchVideo: true,
 
     /*
@@ -2663,11 +2666,23 @@ html.${APP_ID}-fs-active body {
           opacity: 1;
         }
 
+        .${APP_ID}-shorts-ban-slot {
+          display: inline-flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+          width: auto;
+          min-width: 48px;
+          max-width: 72px;
+          color: #fff;
+          pointer-events: auto;
+          touch-action: manipulation;
+          -webkit-tap-highlight-color: transparent;
+          user-select: none;
+        }
+
         .${APP_ID}-shorts-ban-button {
-          position: fixed;
-          top: ${CONFIG.shortsBanButtonTopPx}px;
-          right: ${CONFIG.shortsBanButtonRightPx}px;
-          z-index: 2147483647;
           width: ${shortsSize};
           height: ${shortsSize};
           min-width: ${shortsSize};
@@ -2675,11 +2690,11 @@ html.${APP_ID}-fs-active body {
           padding: 0;
           border: 0;
           border-radius: 999px;
-          background: rgba(0, 0, 0, 0.74);
-          color: rgba(255, 255, 255, 0.96);
+          background: rgba(255, 255, 255, 0.14);
+          color: rgba(255, 255, 255, 0.98);
           font: ${CONFIG.shortsBanButtonFontPx}px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
           font-weight: 850;
-          box-shadow: 0 3px 16px rgba(0,0,0,.38);
+          box-shadow: 0 2px 10px rgba(0,0,0,.24);
           display: flex;
           align-items: center;
           justify-content: center;
@@ -2687,12 +2702,36 @@ html.${APP_ID}-fs-active body {
           touch-action: manipulation;
           -webkit-tap-highlight-color: transparent;
           user-select: none;
-          opacity: 0.70;
+          opacity: 0.94;
+          backdrop-filter: blur(8px);
+          -webkit-backdrop-filter: blur(8px);
         }
 
         .${APP_ID}-shorts-ban-button:active {
           opacity: 1;
           transform: scale(0.96);
+        }
+
+        .${APP_ID}-shorts-ban-label {
+          min-height: 16px;
+          max-width: 72px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          text-align: center;
+          color: rgba(255, 255, 255, 0.96);
+          font: 12px/1.12 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+          font-weight: 650;
+          text-shadow: 0 1px 3px rgba(0,0,0,.55);
+        }
+
+        .${APP_ID}-shorts-ban-button.${APP_ID}-shorts-ban-fixed {
+          position: fixed;
+          top: ${CONFIG.shortsBanButtonTopPx}px;
+          right: ${CONFIG.shortsBanButtonRightPx}px;
+          z-index: 2147483647;
+          background: rgba(0, 0, 0, 0.74);
+          box-shadow: 0 3px 16px rgba(0,0,0,.38);
         }
 
         [data-${APP_ID}-channel-card="1"] {
@@ -4047,6 +4086,156 @@ html.${APP_ID}-fs-active body {
   }
 
 
+
+  function getShortsActionBarRoot() {
+    try {
+      const currentRoot = getCurrentShortsRoot();
+
+      const selectors = [
+        '.ytReelPlayerOverlayViewModelActionsContainer reel-action-bar-view-model',
+        '.ytReelPlayerOverlayViewModelActionsContainer',
+        'reel-action-bar-view-model.ytwReelActionBarViewModelHost',
+        'reel-action-bar-view-model',
+        '.ytwReelActionBarViewModelHost',
+      ];
+
+      for (const scope of [currentRoot, document]) {
+        if (!scope?.querySelector) continue;
+
+        for (const selector of selectors) {
+          const el = scope.querySelector(selector);
+          if (el) return el;
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  function createShortsBanSlot() {
+    const slot = document.createElement('div');
+    slot.className = `${APP_ID}-shorts-ban-slot ytwReelActionBarViewModelHostDesktopActionButton`;
+    slot.dataset.cuShortsBanSlot = '1';
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `${APP_ID}-shorts-ban-button`;
+    button.textContent = CONFIG.channelBanButtonText;
+    button.title = 'Скрыть канал Shorts';
+    button.setAttribute('aria-label', 'Скрыть канал Shorts');
+    button.setAttribute('aria-haspopup', 'false');
+
+    const label = document.createElement('div');
+    label.className = `${APP_ID}-shorts-ban-label`;
+    label.setAttribute('aria-hidden', 'true');
+    label.textContent = CONFIG.shortsBanButtonActionBarLabel || 'ЧС';
+
+    button.addEventListener(
+      'click',
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
+        const info = extractCurrentShortsChannelInfo();
+
+        if (!info) {
+          toast(`${APP_SHORT}: не нашёл канал Shorts`, 1200);
+          return;
+        }
+
+        const shortsVideoId = getCurrentShortsVideoId();
+        const didBan = banChannel(info, {
+          source: 'shorts-button',
+          videoId: shortsVideoId,
+        });
+
+        const poopMeta = {
+          source: 'shorts-button',
+          videoId: shortsVideoId,
+        };
+
+        recordPoopAction(info, poopMeta, didBan);
+
+        if (didBan) {
+          sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId })
+            .then(() => recordPoopAction(info, poopMeta, didBan))
+            .catch(() => recordPoopAction(info, poopMeta, didBan));
+
+          if (CONFIG.shortsAdvanceAfterPoopEnabled) {
+            setTimeout(() => {
+              advanceToNextShort('after-poop');
+              scheduleBlockedShortsCheck('after-poop-check', CONFIG.shortsSkipBannedDelayMs);
+            }, CONFIG.shortsAdvanceAfterPoopDelayMs);
+          }
+        }
+      },
+      true,
+    );
+
+    slot.appendChild(button);
+    slot.appendChild(label);
+
+    return slot;
+  }
+
+  function attachShortsBanButtonToActionBar() {
+    if (!CONFIG.shortsBanButtonPreferActionBar) return false;
+
+    try {
+      const actionBar = getShortsActionBarRoot();
+      if (!actionBar) return false;
+
+      if (!state.shortsBanButtonEl) {
+        state.shortsBanButtonEl = createShortsBanSlot();
+      }
+
+      state.shortsBanButtonEl.classList.remove(`${APP_ID}-shorts-ban-fixed`);
+
+      if (state.shortsBanButtonEl.parentNode !== actionBar) {
+        actionBar.appendChild(state.shortsBanButtonEl);
+      }
+
+      state.shortsBanButtonEl.style.display = 'inline-flex';
+      state.shortsBanButtonEl.dataset.cuShortsBanPlacement = 'action-bar';
+
+      const button = state.shortsBanButtonEl.querySelector?.(`.${APP_ID}-shorts-ban-button`);
+      if (button) button.classList.remove(`${APP_ID}-shorts-ban-fixed`);
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function attachShortsBanButtonFixedFallback() {
+    if (!CONFIG.shortsBanButtonFallbackFixed) return false;
+
+    try {
+      if (!state.shortsBanButtonEl) {
+        state.shortsBanButtonEl = createShortsBanSlot();
+      }
+
+      const root = document.body || document.documentElement;
+      if (state.shortsBanButtonEl.parentNode !== root) {
+        root.appendChild(state.shortsBanButtonEl);
+      }
+
+      state.shortsBanButtonEl.style.display = 'inline-flex';
+      state.shortsBanButtonEl.dataset.cuShortsBanPlacement = 'fixed';
+
+      const button = state.shortsBanButtonEl.querySelector?.(`.${APP_ID}-shorts-ban-button`);
+      if (button) button.classList.add(`${APP_ID}-shorts-ban-fixed`);
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+
   function ensureShortsBanButton() {
     if (!CONFIG.channelFilterEnabled || !CONFIG.channelBanButtonEnabled || !CONFIG.shortsBanOverlayEnabled) return;
     if (!isShortsPage()) {
@@ -4057,66 +4246,11 @@ html.${APP_ID}-fs-active body {
     try {
       ensureChannelFilterStyle();
 
-      if (!state.shortsBanButtonEl) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = `${APP_ID}-shorts-ban-button`;
-        button.textContent = CONFIG.channelBanButtonText;
-        button.title = 'Скрыть канал Shorts';
-        button.setAttribute('aria-label', 'Скрыть канал Shorts');
+      const attachedToActionBar = attachShortsBanButtonToActionBar();
 
-        button.addEventListener(
-          'click',
-          (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
-
-            const info = extractCurrentShortsChannelInfo();
-
-            if (!info) {
-              toast(`${APP_SHORT}: не нашёл канал Shorts`, 1200);
-              return;
-            }
-
-            const shortsVideoId = getCurrentShortsVideoId();
-            const didBan = banChannel(info, {
-              source: 'shorts-button',
-              videoId: shortsVideoId,
-            });
-
-            const poopMeta = {
-              source: 'shorts-button',
-              videoId: shortsVideoId,
-            };
-
-            recordPoopAction(info, poopMeta, didBan);
-
-            if (didBan) {
-              sendShortsNegativeFeedback(info, 'shorts-ban', { videoId: shortsVideoId })
-                .then(() => recordPoopAction(info, poopMeta, didBan))
-                .catch(() => recordPoopAction(info, poopMeta, didBan));
-
-              if (CONFIG.shortsAdvanceAfterPoopEnabled) {
-                setTimeout(() => {
-                  advanceToNextShort('after-poop');
-                  scheduleBlockedShortsCheck('after-poop-check', CONFIG.shortsSkipBannedDelayMs);
-                }, CONFIG.shortsAdvanceAfterPoopDelayMs);
-              }
-            }
-          },
-          true,
-        );
-
-        state.shortsBanButtonEl = button;
+      if (!attachedToActionBar) {
+        attachShortsBanButtonFixedFallback();
       }
-
-      const root = document.body || document.documentElement;
-      if (state.shortsBanButtonEl.parentNode !== root) {
-        root.appendChild(state.shortsBanButtonEl);
-      }
-
-      state.shortsBanButtonEl.style.display = 'flex';
     } catch {}
   }
 
@@ -4532,7 +4666,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.7',
+      version: '0.3.8',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -4585,6 +4719,8 @@ html.${APP_ID}-fs-active body {
       channelBanButtonText: CONFIG.channelBanButtonText,
       channelBanButtons: document.querySelectorAll(`.${APP_ID}-channel-ban-button`).length,
       shortsBanButtonVisible: Boolean(state.shortsBanButtonEl && state.shortsBanButtonEl.style.display !== 'none'),
+      shortsBanButtonPlacement: state.shortsBanButtonEl?.dataset?.cuShortsBanPlacement || '',
+      shortsActionBarFound: Boolean(getShortsActionBarRoot()),
       negativeFeedbackEnabled: CONFIG.negativeFeedbackEnabled,
       negativeFeedbackUseMenu: CONFIG.negativeFeedbackUseMenu,
       negativeFeedbackCloseWrongMenu: CONFIG.negativeFeedbackCloseWrongMenu,
