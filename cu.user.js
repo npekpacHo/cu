@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home card feedback, home poop safe-mode, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, карточный feedback главной, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, ambient Shorts cleanup, no home poop, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, чистка Shorts вне вкладки Shorts, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.14
+// @version      0.3.15
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -358,6 +358,24 @@
     homeCleanupDisablePreviewAutoplay: true,
     homeCleanupHidePaidContentOverlays: true,
     homeCleanupHideInlinePreviewOverlays: true,
+
+    /*
+      0.3.15:
+      Shorts оставляем как отдельный раздел и нижнюю кнопку навигации,
+      но вычищаем их из главной, поиска, рекомендаций и прочих лент.
+    */
+    ambientShortsCleanupEnabled: true,
+    ambientShortsCleanupDelayMs: 650,
+    ambientShortsCleanupMutationDelayMs: 1400,
+    ambientShortsCleanupMaxLinksPerScan: 160,
+    ambientShortsCleanupMaxTextNodesPerScan: 90,
+    ambientShortsCleanupHideShelves: true,
+    ambientShortsCleanupHideCards: true,
+    ambientShortsCleanupHideChips: true,
+    ambientShortsCleanupHideMyJam: true,
+    ambientShortsCleanupDisablePreviewAutoplay: true,
+    ambientShortsCleanupKeepBottomNav: true,
+    ambientShortsCleanupKeepDirectShortsPage: true,
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -406,6 +424,8 @@
     lastHomePoopResult: null,
     homeCleanupTimer: 0,
     lastHomeCleanupResult: null,
+    ambientShortsCleanupTimer: 0,
+    lastAmbientShortsCleanupResult: null,
     lastCardFeedbackResult: null,
     cardFeedbackBusyUntilMs: 0,
     shortsBanButtonEl: null,
@@ -2911,7 +2931,8 @@ html.${APP_ID}-fs-active body {
           pointer-events: none !important;
         }
 
-        [data-${APP_ID}-home-clean-hidden="1"] {
+        [data-${APP_ID}-home-clean-hidden="1"],
+        [data-${APP_ID}-ambient-shorts-hidden="1"] {
           display: none !important;
           visibility: hidden !important;
         }
@@ -5781,6 +5802,277 @@ html.${APP_ID}-fs-active body {
 
 
 
+
+  function isAllowedShortsPage() {
+    if (!CONFIG.ambientShortsCleanupKeepDirectShortsPage) return false;
+
+    return isShortsPage() || isSourceShortsPage();
+  }
+
+  function shouldRunAmbientShortsCleanupTasks() {
+    if (!CONFIG.ambientShortsCleanupEnabled) return false;
+    if (!isSupportedYouTubeHost()) return false;
+    if (isAllowedShortsPage()) return false;
+
+    return true;
+  }
+
+  function isAllowedShortsNavigationElement(el) {
+    if (!CONFIG.ambientShortsCleanupKeepBottomNav) return false;
+
+    try {
+      return Boolean(
+        el?.closest?.(
+          [
+            'ytm-pivot-bar-renderer',
+            'ytm-pivot-bar-item-renderer',
+            '#pivot-bar',
+            '.pivot-bar',
+            '.ytm-pivot-bar-renderer',
+            'ytm-mobile-topbar-renderer',
+          ].join(','),
+        ),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function isShortsHref(href) {
+    try {
+      const url = new URL(href, location.origin);
+      return /^\/shorts\//.test(url.pathname);
+    } catch {
+      return /\/shorts\//.test(String(href || ''));
+    }
+  }
+
+  function findAmbientShortsContainer(anchor) {
+    try {
+      if (!anchor || isAllowedShortsNavigationElement(anchor)) return null;
+
+      const shelf = anchor.closest?.(
+        [
+          'ytm-reel-shelf-renderer',
+          'ytm-rich-section-renderer',
+          'ytd-reel-shelf-renderer',
+          'ytd-rich-section-renderer',
+          'ytd-rich-shelf-renderer',
+          'ytd-shelf-renderer',
+        ].join(','),
+      );
+
+      if (shelf) return shelf;
+
+      return anchor.closest?.(
+        [
+          'ytm-shorts-lockup-view-model',
+          'ytm-shorts-lockup-view-model-v2',
+          'ytm-shorts-lockup-view-model-v3',
+          'ytm-reel-item-renderer',
+          'ytm-reel-video-renderer',
+          'ytm-rich-item-renderer',
+          'ytm-video-with-context-renderer',
+          'ytm-compact-video-renderer',
+          'ytm-video-card-renderer',
+          'yt-lockup-view-model',
+          'ytd-reel-item-renderer',
+          'ytd-rich-item-renderer',
+          'ytd-video-renderer',
+          'ytd-compact-video-renderer',
+          'ytd-grid-video-renderer',
+          'ytd-playlist-video-renderer',
+        ].join(','),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  function getAmbientShortsTextCandidates() {
+    try {
+      const selectors = [
+        'ytm-rich-section-renderer',
+        'ytm-reel-shelf-renderer',
+        'ytm-item-section-renderer',
+        'ytm-rich-item-renderer',
+        'ytm-chip-cloud-chip-renderer',
+        'ytd-rich-section-renderer',
+        'ytd-reel-shelf-renderer',
+        'ytd-rich-shelf-renderer',
+        'ytd-shelf-renderer',
+        'ytd-rich-item-renderer',
+        'ytd-video-renderer',
+        'yt-chip-cloud-chip-renderer',
+        'ytm-chip-cloud-chip-renderer',
+      ];
+
+      const nodes = [];
+      const seen = new Set();
+
+      for (const selector of selectors) {
+        for (const node of document.querySelectorAll(selector)) {
+          if (!node || seen.has(node)) continue;
+          if (isAllowedShortsNavigationElement(node)) continue;
+
+          seen.add(node);
+          nodes.push(node);
+
+          if (nodes.length >= CONFIG.ambientShortsCleanupMaxTextNodesPerScan) {
+            return nodes;
+          }
+        }
+      }
+
+      return nodes;
+    } catch {
+      return [];
+    }
+  }
+
+  function isAmbientShortsOrJamNode(node) {
+    if (!node || !node.querySelector) return false;
+
+    try {
+      const text = getNodeOwnText(node).toLowerCase();
+      const html = String(node.outerHTML || '').slice(0, 28000).toLowerCase();
+
+      if (CONFIG.ambientShortsCleanupHideShelves || CONFIG.ambientShortsCleanupHideCards) {
+        if (
+          /(^|\s|#)shorts(\s|$)/i.test(text) ||
+          text.includes('shorts') ||
+          text.includes('шортс') ||
+          text.includes('шортсы') ||
+          html.includes('/shorts/') ||
+          html.includes('reel-shelf') ||
+          html.includes('reel_item') ||
+          html.includes('shorts-lockup')
+        ) {
+          return true;
+        }
+      }
+
+      if (CONFIG.ambientShortsCleanupHideMyJam) {
+        if (
+          text.includes('мой джем') ||
+          text.includes('my jam') ||
+          text.includes('джем') ||
+          html.includes('my_jam') ||
+          html.includes('music-jam') ||
+          html.includes('music_jam')
+        ) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  function stopAmbientPreviewVideos(reason = 'ambient-preview') {
+    if (!CONFIG.ambientShortsCleanupDisablePreviewAutoplay || !shouldRunAmbientShortsCleanupTasks()) return 0;
+
+    let stopped = 0;
+
+    try {
+      for (const video of Array.from(document.querySelectorAll('video')).slice(0, 16)) {
+        try {
+          if (!video || video.closest?.('ytd-player, ytm-player, #movie_player')) continue;
+
+          video.pause();
+          video.muted = true;
+          video.autoplay = false;
+          video.preload = 'none';
+          stopped += 1;
+        } catch {}
+      }
+    } catch {}
+
+    if (stopped) log('ambient previews stopped', reason, stopped);
+    return stopped;
+  }
+
+  function processAmbientShortsCleanup(reason = 'ambient-shorts-cleanup') {
+    if (!shouldRunAmbientShortsCleanupTasks()) return null;
+
+    try {
+      ensureHomeCleanupStyle();
+
+      const hiddenNodes = new Set();
+      let links = 0;
+      let hiddenByLink = 0;
+      let hiddenByText = 0;
+
+      const anchors = Array.from(
+        document.querySelectorAll('a[href^="/shorts/"], a[href*="youtube.com/shorts/"]'),
+      ).slice(0, CONFIG.ambientShortsCleanupMaxLinksPerScan);
+
+      for (const anchor of anchors) {
+        if (!isShortsHref(anchor.getAttribute('href') || anchor.href || '')) continue;
+        if (isAllowedShortsNavigationElement(anchor)) continue;
+
+        links += 1;
+        const container = findAmbientShortsContainer(anchor);
+
+        if (container && !hiddenNodes.has(container)) {
+          container.dataset.cuAmbientShortsHidden = '1';
+          hiddenNodes.add(container);
+          hiddenByLink += 1;
+        }
+      }
+
+      for (const node of getAmbientShortsTextCandidates()) {
+        if (hiddenNodes.has(node)) continue;
+        if (isAmbientShortsOrJamNode(node)) {
+          node.dataset.cuAmbientShortsHidden = '1';
+          hiddenNodes.add(node);
+          hiddenByText += 1;
+        }
+      }
+
+      const stoppedPreviews = stopAmbientPreviewVideos(reason);
+
+      state.lastAmbientShortsCleanupResult = {
+        reason,
+        links,
+        hiddenByLink,
+        hiddenByText,
+        hidden: hiddenByLink + hiddenByText,
+        stoppedPreviews,
+        at: new Date().toISOString(),
+      };
+
+      log('ambient shorts cleanup processed', state.lastAmbientShortsCleanupResult);
+      return state.lastAmbientShortsCleanupResult;
+    } catch (error) {
+      state.lastAmbientShortsCleanupResult = {
+        reason,
+        error: String(error && error.message ? error.message : error),
+        at: new Date().toISOString(),
+      };
+
+      log('ambient shorts cleanup failed', state.lastAmbientShortsCleanupResult);
+      return state.lastAmbientShortsCleanupResult;
+    }
+  }
+
+  function scheduleAmbientShortsCleanup(reason = 'scheduled', delay = CONFIG.ambientShortsCleanupDelayMs) {
+    if (!shouldRunAmbientShortsCleanupTasks()) return;
+
+    clearTimeout(state.ambientShortsCleanupTimer);
+    state.ambientShortsCleanupTimer = setTimeout(() => processAmbientShortsCleanup(reason), delay);
+  }
+
+  window.cuProcessShortsCleanup = function cuProcessShortsCleanup() {
+    return processAmbientShortsCleanup('manual-console');
+  };
+
+  window.cuLastShortsCleanup = function cuLastShortsCleanup() {
+    return state.lastAmbientShortsCleanupResult;
+  };
+
   function shouldRunHomeCleanupTasks() {
     return Boolean(CONFIG.homeCleanupEnabled && isHomeSafeModePage());
   }
@@ -5954,7 +6246,12 @@ html.${APP_ID}-fs-active body {
         (event) => {
           const target = event.target;
 
-          if (!CONFIG.homeCleanupDisablePreviewAutoplay || !isHomeSafeModePage()) return;
+          if (
+            !(
+              (CONFIG.homeCleanupDisablePreviewAutoplay && isHomeSafeModePage()) ||
+              (CONFIG.ambientShortsCleanupDisablePreviewAutoplay && shouldRunAmbientShortsCleanupTasks())
+            )
+          ) return;
           if (!target || String(target.tagName || '').toLowerCase() !== 'video') return;
           if (target.closest?.('ytd-player, ytm-player, #movie_player')) return;
 
@@ -6084,6 +6381,10 @@ html.${APP_ID}-fs-active body {
       scheduleHomeCleanup(reason);
     }
 
+    if (shouldRunAmbientShortsCleanupTasks()) {
+      scheduleAmbientShortsCleanup(reason);
+    }
+
     if (shouldRunHomePoopTasks()) {
       scheduleHomePoop(reason);
     }
@@ -6144,6 +6445,7 @@ html.${APP_ID}-fs-active body {
         if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableMutationHeavyTasks) {
           scheduleHomeChipsCleanup('mutation-home-safe');
           scheduleHomeCleanup('mutation-home-safe', CONFIG.homeCleanupMutationDelayMs);
+          scheduleAmbientShortsCleanup('mutation-home-safe', CONFIG.ambientShortsCleanupMutationDelayMs);
           scheduleHomePoop('mutation-home-safe', CONFIG.homePoopMutationDelayMs);
           return;
         }
@@ -6158,6 +6460,10 @@ html.${APP_ID}-fs-active body {
 
         if (shouldRunHomeCleanupTasks()) {
           scheduleHomeCleanup('mutation', CONFIG.homeCleanupMutationDelayMs);
+        }
+
+        if (shouldRunAmbientShortsCleanupTasks()) {
+          scheduleAmbientShortsCleanup('mutation', CONFIG.ambientShortsCleanupMutationDelayMs);
         }
 
         if (shouldRunHomePoopTasks()) {
@@ -6266,13 +6572,16 @@ html.${APP_ID}-fs-active body {
       shouldRunHeavyPlayerTasks: shouldRunHeavyPlayerTasks(),
       shouldRunHomePoopTasks: shouldRunHomePoopTasks(),
       shouldRunHomeCleanupTasks: shouldRunHomeCleanupTasks(),
+      shouldRunAmbientShortsCleanupTasks: shouldRunAmbientShortsCleanupTasks(),
       shouldRunChannelFilterTasks: shouldRunChannelFilterTasks(),
       shouldRunVolumeSyncTasks: shouldRunVolumeSyncTasks(),
       homePoopEnabled: CONFIG.homePoopEnabled,
       homeCleanupEnabled: CONFIG.homeCleanupEnabled,
+      ambientShortsCleanupEnabled: CONFIG.ambientShortsCleanupEnabled,
       homePoopNegativeFeedback: CONFIG.homePoopNegativeFeedback,
       cardFeedbackEnabled: CONFIG.cardFeedbackEnabled,
       lastHomeCleanupResult: state.lastHomeCleanupResult,
+      lastAmbientShortsCleanupResult: state.lastAmbientShortsCleanupResult,
       lastHomePoopResult: state.lastHomePoopResult,
       lastCardFeedbackResult: state.lastCardFeedbackResult,
       cardFeedbackBusy: Date.now() < state.cardFeedbackBusyUntilMs,
@@ -6345,6 +6654,10 @@ html.${APP_ID}-fs-active body {
       scheduleHomeCleanup('init');
     }
 
+    if (shouldRunAmbientShortsCleanupTasks()) {
+      scheduleAmbientShortsCleanup('init');
+    }
+
     if (shouldRunHomePoopTasks()) {
       scheduleHomePoop('init');
     }
@@ -6376,6 +6689,10 @@ html.${APP_ID}-fs-active body {
 
         if (shouldRunHomeCleanupTasks()) {
           scheduleHomeCleanup('visibility');
+        }
+
+        if (shouldRunAmbientShortsCleanupTasks()) {
+          scheduleAmbientShortsCleanup('visibility');
         }
 
         if (shouldRunHomePoopTasks()) {
