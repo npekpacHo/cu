@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home card feedback, home poop safe-mode, race-safe Shorts blacklist, synced volume, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, карточный feedback главной, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home card feedback, home poop safe-mode, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, карточный feedback главной, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.12
+// @version      0.3.13
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -129,12 +129,36 @@
       а наоборот смотреть ночью по-человечески.
     */
     volumeControlEnabled: true,
-    volumeStorageKey: 'cu:volume:v1',
+    volumeStorageKey: 'cu:volume:v2',
+    volumeLegacyStorageKey: 'cu:volume:v1',
     volumeDefaultPercent: 30,
     volumeMinPercent: 0,
     volumeMaxPercent: 100,
     volumeStepPercent: 1,
     volumeSliderWidthPx: 126,
+
+    /*
+      0.3.13:
+      Комфортная кривая микшера.
+      100% ползунка = 100% HTML-громкости.
+      80% ползунка = 50% HTML-громкости.
+      Ниже остаётся плавная тонкая регулировка.
+    */
+    volumeComfortCurveEnabled: true,
+    volumeSliderPercentForHalfActual: 80,
+    volumeHalfActualPercent: 50,
+    volumeLabelShowsActualPercent: true,
+
+    /*
+      Управление звуком в Shorts.
+      В обычных видео ползунок живёт в наших нижних кнопках, но в Shorts этих
+      кнопок нет, поэтому добавляем отдельный пункт в штатный action bar.
+    */
+    shortsVolumeControlEnabled: true,
+    shortsVolumeButtonText: '🔉',
+    shortsVolumeActionBarLabel: 'Звук',
+    shortsVolumePanelAutoHideMs: 3600,
+    shortsVolumePanelBottomPx: 86,
 
     /*
       0.2.9:
@@ -351,6 +375,14 @@
     volumeActiveTrackEl: null,
     volumeThumbEl: null,
     volumeLabelEl: null,
+    shortsVolumeSlotEl: null,
+    shortsVolumeButtonEl: null,
+    shortsVolumePanelEl: null,
+    shortsVolumeSliderEl: null,
+    shortsVolumeActiveTrackEl: null,
+    shortsVolumeThumbEl: null,
+    shortsVolumeLabelEl: null,
+    shortsVolumeHideTimer: 0,
     fullscreenLayoutFixRoot: null,
     fullscreenLayoutFixTimerIds: [],
     homeChipsTimer: 0,
@@ -1758,15 +1790,96 @@ html.${APP_ID}-fs-active body {
     return clampNumber(value, CONFIG.volumeMinPercent, CONFIG.volumeMaxPercent);
   }
 
+  function getVolumeCurveExponent() {
+    try {
+      const sliderAtHalf = clampNumber(CONFIG.volumeSliderPercentForHalfActual, 1, 99) / 100;
+      const halfActual = clampNumber(CONFIG.volumeHalfActualPercent, 1, 99) / 100;
+
+      return Math.log(halfActual) / Math.log(sliderAtHalf);
+    } catch {
+      return 1;
+    }
+  }
+
+  function sliderPercentToActualVolumePercent(sliderPercent) {
+    const slider = normalizeVolumePercent(sliderPercent);
+
+    if (!CONFIG.volumeComfortCurveEnabled) return slider;
+    if (slider <= 0) return 0;
+    if (slider >= 100) return 100;
+
+    const exponent = getVolumeCurveExponent();
+    const actual = Math.pow(slider / 100, exponent) * 100;
+
+    return clampNumber(actual, 0, 100);
+  }
+
+  function actualVolumePercentToSliderPercent(actualPercent) {
+    const actual = clampNumber(actualPercent, 0, 100);
+
+    if (!CONFIG.volumeComfortCurveEnabled) return actual;
+    if (actual <= 0) return 0;
+    if (actual >= 100) return 100;
+
+    const exponent = getVolumeCurveExponent();
+    const slider = Math.pow(actual / 100, 1 / exponent) * 100;
+
+    return clampNumber(slider, 0, 100);
+  }
+
+  function formatPercent(value) {
+    const num = Number(value);
+
+    if (!Number.isFinite(num)) return '0';
+    if (num >= 10 || num === 0) return String(Math.round(num));
+
+    return num.toFixed(1).replace(/\.0$/, '');
+  }
+
+  function getVolumeLabelText(sliderPercent) {
+    const slider = normalizeVolumePercent(sliderPercent);
+    const actual = sliderPercentToActualVolumePercent(slider);
+
+    return CONFIG.volumeLabelShowsActualPercent
+      ? `${formatPercent(actual)}%`
+      : `${Math.round(slider)}%`;
+  }
+
+  function getVolumeTitle(sliderPercent) {
+    const slider = normalizeVolumePercent(sliderPercent);
+    const actual = sliderPercentToActualVolumePercent(slider);
+
+    return `Громкость ${formatPercent(actual)}%, ползунок ${Math.round(slider)}%`;
+  }
+
   function readStoredVolumePercent() {
     try {
       const raw = localStorage.getItem(CONFIG.volumeStorageKey);
-      if (raw === null || raw === '') return null;
+      if (raw !== null && raw !== '') {
+        const value = Number(raw);
+        if (Number.isFinite(value)) return normalizeVolumePercent(value);
+      }
 
-      const value = Number(raw);
-      if (!Number.isFinite(value)) return null;
+      /*
+        Миграция со старой линейной шкалы.
+        В v1 значение было реальной HTML-громкостью. В v2 храним положение
+        комфортного ползунка, поэтому фактическая громкость не должна прыгнуть.
+      */
+      const legacyRaw = CONFIG.volumeLegacyStorageKey
+        ? localStorage.getItem(CONFIG.volumeLegacyStorageKey)
+        : null;
 
-      return normalizeVolumePercent(value);
+      if (legacyRaw !== null && legacyRaw !== '') {
+        const legacyActual = Number(legacyRaw);
+
+        if (Number.isFinite(legacyActual)) {
+          const migrated = actualVolumePercentToSliderPercent(legacyActual);
+          writeStoredVolumePercent(migrated);
+          return normalizeVolumePercent(migrated);
+        }
+      }
+
+      return null;
     } catch {
       return null;
     }
@@ -1778,31 +1891,36 @@ html.${APP_ID}-fs-active body {
     } catch {}
   }
 
-  function getVideoVolumePercent(video = getVideo()) {
-    if (!video) return CONFIG.volumeDefaultPercent;
+  function getVideoActualVolumePercent(video = getVideo()) {
+    if (!video) return sliderPercentToActualVolumePercent(CONFIG.volumeDefaultPercent);
 
     try {
       if (video.muted) return 0;
-      return Math.round(clampNumber(video.volume * 100, 0, 100));
+      return clampNumber(video.volume * 100, 0, 100);
     } catch {
-      return CONFIG.volumeDefaultPercent;
+      return sliderPercentToActualVolumePercent(CONFIG.volumeDefaultPercent);
     }
+  }
+
+  function getVideoVolumePercent(video = getVideo()) {
+    return Math.round(actualVolumePercentToSliderPercent(getVideoActualVolumePercent(video)));
   }
 
 
   function setSingleVideoVolume(video, percent) {
     if (!video) return false;
 
-    const normalized = normalizeVolumePercent(percent);
-    const volume = normalized / 100;
+    const slider = normalizeVolumePercent(percent);
+    const actual = sliderPercentToActualVolumePercent(slider);
+    const volume = actual / 100;
 
     try {
       state.volumeInternalChangeUntilMs = Date.now() + 350;
 
       video.volume = volume;
-      video.muted = normalized <= 0;
+      video.muted = actual <= 0.0001;
 
-      if (normalized > 0 && video.muted) {
+      if (actual > 0 && video.muted) {
         video.muted = false;
       }
 
@@ -1858,12 +1976,14 @@ html.${APP_ID}-fs-active body {
 
     state.lastVolumeSyncResult = {
       reason,
-      stored,
+      storedSlider: stored,
+      storedActual: sliderPercentToActualVolumePercent(stored),
       videos: videos.length,
       changed,
       skipped,
       errors,
-      activeVolume: getVideoVolumePercent(getVideo()),
+      activeSlider: getVideoVolumePercent(getVideo()),
+      activeActual: getVideoActualVolumePercent(getVideo()),
       at: new Date().toISOString(),
     };
 
@@ -1938,19 +2058,26 @@ html.${APP_ID}-fs-active body {
 
       state.lastVolumeSyncResult = {
         reason,
-        stored: normalized,
+        storedSlider: normalized,
+        storedActual: sliderPercentToActualVolumePercent(normalized),
         videos: videos.length,
         changed,
         skipped: 0,
         errors,
-        activeVolume: getVideoVolumePercent(getVideo()),
+        activeSlider: getVideoVolumePercent(getVideo()),
+        activeActual: getVideoActualVolumePercent(getVideo()),
         at: new Date().toISOString(),
       };
 
       updateVolumeControl();
 
+      if (isShortsPage()) {
+        setTimeout(() => syncStoredVolumeToAllVideos(`${reason}:shorts-guard-200`, true), 200);
+        setTimeout(() => syncStoredVolumeToAllVideos(`${reason}:shorts-guard-700`, true), 700);
+      }
+
       if (reason !== 'stored') {
-        toast(`${APP_SHORT}: громкость ${Math.round(normalized)}%`, 650);
+        toast(`${APP_SHORT}: звук ${getVolumeLabelText(normalized)}`, 650);
       }
 
       log('volume set', state.lastVolumeSyncResult);
@@ -1961,42 +2088,78 @@ html.${APP_ID}-fs-active body {
     }
   }
 
-  function updateVolumeSliderVisual(value = null) {
-    const slider = state.volumeSliderEl;
-    const activeTrack = state.volumeActiveTrackEl;
-    const thumb = state.volumeThumbEl;
-
+  function updateVolumeWidgetVisual(slider, activeTrack, thumb, value = null) {
     if (!slider || !activeTrack || !thumb) return;
 
     try {
+      const raw = value === null ? slider.value : value;
       const min = Number(slider.min || CONFIG.volumeMinPercent);
       const max = Number(slider.max || CONFIG.volumeMaxPercent);
-      const raw = value === null ? Number(slider.value || 0) : Number(value);
-      const percent = max > min ? ((raw - min) / (max - min)) * 100 : 0;
-      const clamped = clampNumber(percent, 0, 100);
+      const percent = ((Number(raw) - min) / Math.max(1, max - min)) * 100;
+      const safePercent = clampNumber(percent, 0, 100);
 
-      activeTrack.style.width = `${clamped}%`;
-      thumb.style.left = `${clamped}%`;
+      activeTrack.style.width = `${safePercent}%`;
+      thumb.style.left = `${safePercent}%`;
+    } catch {}
+  }
+
+  function updateVolumeSliderVisual(value = null) {
+    updateVolumeWidgetVisual(
+      state.volumeSliderEl,
+      state.volumeActiveTrackEl,
+      state.volumeThumbEl,
+      value,
+    );
+  }
+
+  function updateShortsVolumeWidgetVisual(value = null) {
+    updateVolumeWidgetVisual(
+      state.shortsVolumeSliderEl,
+      state.shortsVolumeActiveTrackEl,
+      state.shortsVolumeThumbEl,
+      value,
+    );
+  }
+
+  function updateVolumeWidget(slider, label, activeTrack, thumb, sliderPercent) {
+    if (!slider || !label) return;
+
+    const normalized = normalizeVolumePercent(sliderPercent);
+
+    try {
+      slider.value = String(Math.round(normalized));
+      updateVolumeWidgetVisual(slider, activeTrack, thumb, normalized);
+      label.textContent = getVolumeLabelText(normalized);
+      label.title = getVolumeTitle(normalized);
     } catch {}
   }
 
   function updateVolumeControl() {
     if (!CONFIG.volumeControlEnabled) return;
 
-    const slider = state.volumeSliderEl;
-    const label = state.volumeLabelEl;
     const video = getVideo();
+    const percent = video ? getVideoVolumePercent(video) : (readStoredVolumePercent() ?? CONFIG.volumeDefaultPercent);
 
-    if (!slider || !label || !video) return;
+    updateVolumeWidget(
+      state.volumeSliderEl,
+      state.volumeLabelEl,
+      state.volumeActiveTrackEl,
+      state.volumeThumbEl,
+      percent,
+    );
 
-    const percent = getVideoVolumePercent(video);
+    updateVolumeWidget(
+      state.shortsVolumeSliderEl,
+      state.shortsVolumeLabelEl,
+      state.shortsVolumeActiveTrackEl,
+      state.shortsVolumeThumbEl,
+      percent,
+    );
 
-    try {
-      slider.value = String(percent);
-      updateVolumeSliderVisual(percent);
-      label.textContent = `${percent}%`;
-      label.title = `Громкость ${percent}%`;
-    } catch {}
+    if (state.shortsVolumeButtonEl) {
+      state.shortsVolumeButtonEl.title = getVolumeTitle(percent);
+      state.shortsVolumeButtonEl.setAttribute('aria-label', getVolumeTitle(percent));
+    }
   }
 
   function createVolumeControl() {
@@ -2119,7 +2282,8 @@ html.${APP_ID}-fs-active body {
     });
 
     const label = document.createElement('span');
-    label.textContent = `${slider.value}%`;
+    label.textContent = getVolumeLabelText(slider.value);
+    label.title = getVolumeTitle(slider.value);
     label.className = `${APP_ID}-volume-label`;
 
     Object.assign(label.style, {
@@ -4800,11 +4964,394 @@ html.${APP_ID}-fs-active body {
     } catch {}
   }
 
+
+  function createShortsVolumeSlot() {
+    const slot = document.createElement('div');
+    slot.className = `${APP_ID}-shorts-volume-slot ytwReelActionBarViewModelHostDesktopActionButton`;
+    slot.dataset.cuShortsVolumeSlot = '1';
+
+    Object.assign(slot.style, {
+      display: 'inline-flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '4px',
+      minWidth: '48px',
+      maxWidth: '72px',
+      color: '#fff',
+      pointerEvents: 'auto',
+      touchAction: 'manipulation',
+      WebkitTapHighlightColor: 'transparent',
+      userSelect: 'none',
+    });
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `${APP_ID}-shorts-volume-button`;
+    button.textContent = CONFIG.shortsVolumeButtonText || '🔉';
+    button.title = 'Громкость Shorts';
+    button.setAttribute('aria-label', 'Громкость Shorts');
+    button.setAttribute('aria-haspopup', 'true');
+
+    Object.assign(button.style, {
+      width: `${CONFIG.shortsBanButtonSizePx}px`,
+      height: `${CONFIG.shortsBanButtonSizePx}px`,
+      minWidth: `${CONFIG.shortsBanButtonSizePx}px`,
+      minHeight: `${CONFIG.shortsBanButtonSizePx}px`,
+      padding: '0',
+      border: '0',
+      borderRadius: '999px',
+      background: 'rgba(255, 255, 255, 0.14)',
+      color: 'rgba(255, 255, 255, 0.98)',
+      font: '25px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      fontWeight: '850',
+      boxShadow: '0 2px 10px rgba(0,0,0,.24)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      pointerEvents: 'auto',
+      touchAction: 'manipulation',
+      WebkitTapHighlightColor: 'transparent',
+      userSelect: 'none',
+      opacity: '0.94',
+      backdropFilter: 'blur(8px)',
+      WebkitBackdropFilter: 'blur(8px)',
+    });
+
+    const label = document.createElement('div');
+    label.className = `${APP_ID}-shorts-volume-action-label`;
+    label.setAttribute('aria-hidden', 'true');
+    label.textContent = CONFIG.shortsVolumeActionBarLabel || 'Звук';
+
+    Object.assign(label.style, {
+      minHeight: '16px',
+      maxWidth: '72px',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+      textAlign: 'center',
+      color: 'rgba(255,255,255,.96)',
+      font: '12px/1.12 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      fontWeight: '650',
+      textShadow: '0 1px 3px rgba(0,0,0,.55)',
+    });
+
+    button.addEventListener(
+      'click',
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+
+        toggleShortsVolumePanel();
+      },
+      true,
+    );
+
+    slot.appendChild(button);
+    slot.appendChild(label);
+
+    state.shortsVolumeButtonEl = button;
+
+    return slot;
+  }
+
+  function createShortsVolumePanel() {
+    const panel = document.createElement('div');
+    panel.className = `${APP_ID}-shorts-volume-panel`;
+
+    Object.assign(panel.style, {
+      position: 'fixed',
+      left: '12px',
+      right: '12px',
+      bottom: `${CONFIG.shortsVolumePanelBottomPx}px`,
+      zIndex: '2147483647',
+      display: 'none',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '9px',
+      padding: '11px 13px',
+      borderRadius: '22px',
+      background: 'rgba(0,0,0,.72)',
+      color: 'rgba(255,255,255,.92)',
+      boxShadow: '0 6px 24px rgba(0,0,0,.38)',
+      backdropFilter: 'blur(10px)',
+      WebkitBackdropFilter: 'blur(10px)',
+      pointerEvents: 'auto',
+      touchAction: 'manipulation',
+      WebkitTapHighlightColor: 'transparent',
+      userSelect: 'none',
+    });
+
+    const icon = document.createElement('span');
+    icon.textContent = '🔉';
+    icon.setAttribute('aria-hidden', 'true');
+
+    Object.assign(icon.style, {
+      font: '18px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      opacity: '0.92',
+    });
+
+    const sliderWrap = document.createElement('div');
+
+    Object.assign(sliderWrap.style, {
+      position: 'relative',
+      width: 'min(58vw, 220px)',
+      height: `${Math.max(CONFIG.volumeThumbSizePx, CONFIG.volumeTrackHeightActivePx) + 10}px`,
+      display: 'flex',
+      alignItems: 'center',
+      flex: '0 1 auto',
+      pointerEvents: 'auto',
+      touchAction: 'pan-x',
+    });
+
+    const inactiveTrack = document.createElement('div');
+    Object.assign(inactiveTrack.style, {
+      position: 'absolute',
+      left: '0',
+      right: '0',
+      top: '50%',
+      height: `${CONFIG.volumeTrackHeightInactivePx}px`,
+      transform: 'translateY(-50%)',
+      borderRadius: '999px',
+      background: CONFIG.volumeTrackColorInactive,
+      pointerEvents: 'none',
+    });
+
+    const activeTrack = document.createElement('div');
+    activeTrack.className = `${APP_ID}-shorts-volume-track-active`;
+    Object.assign(activeTrack.style, {
+      position: 'absolute',
+      left: '0',
+      top: '50%',
+      width: '30%',
+      height: `${CONFIG.volumeTrackHeightActivePx}px`,
+      transform: 'translateY(-50%)',
+      borderRadius: '999px',
+      background: CONFIG.volumeTrackColorActive,
+      pointerEvents: 'none',
+    });
+
+    const thumb = document.createElement('div');
+    thumb.className = `${APP_ID}-shorts-volume-thumb`;
+    Object.assign(thumb.style, {
+      position: 'absolute',
+      left: '30%',
+      top: '50%',
+      width: `${CONFIG.volumeThumbSizePx}px`,
+      height: `${CONFIG.volumeThumbSizePx}px`,
+      transform: 'translate(-50%, -50%)',
+      borderRadius: '999px',
+      border: '2px solid rgba(255,255,255,.92)',
+      background: 'rgba(255,255,255,.92)',
+      boxShadow: '0 2px 8px rgba(0,0,0,.40)',
+      pointerEvents: 'none',
+    });
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = String(CONFIG.volumeMinPercent);
+    slider.max = String(CONFIG.volumeMaxPercent);
+    slider.step = String(CONFIG.volumeStepPercent);
+    slider.value = String(readStoredVolumePercent() ?? CONFIG.volumeDefaultPercent);
+    slider.setAttribute('aria-label', 'Громкость Shorts');
+
+    Object.assign(slider.style, {
+      position: 'absolute',
+      inset: '0',
+      width: '100%',
+      height: '100%',
+      margin: '0',
+      padding: '0',
+      opacity: '0.001',
+      cursor: 'pointer',
+      pointerEvents: 'auto',
+      touchAction: 'pan-x',
+    });
+
+    const label = document.createElement('span');
+    label.className = `${APP_ID}-shorts-volume-label`;
+    label.textContent = getVolumeLabelText(slider.value);
+    label.title = getVolumeTitle(slider.value);
+
+    Object.assign(label.style, {
+      minWidth: '38px',
+      textAlign: 'right',
+      font: '13px/1 system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+      fontWeight: '750',
+      color: 'rgba(255,255,255,.88)',
+    });
+
+    const stop = (event) => {
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      showShortsVolumePanel();
+    };
+
+    ['pointerdown', 'touchstart', 'click'].forEach((name) => {
+      panel.addEventListener(name, stop, true);
+      sliderWrap.addEventListener(name, stop, true);
+      slider.addEventListener(name, stop, true);
+    });
+
+    const onInput = (event, reason) => {
+      event.preventDefault();
+      event.stopPropagation();
+      updateVolumeWidgetVisual(slider, activeTrack, thumb, slider.value);
+      setVideoVolumePercent(slider.value, reason);
+      syncStoredVolumeToAllVideos(reason, true);
+      showShortsVolumePanel();
+    };
+
+    slider.addEventListener('input', (event) => onInput(event, 'shorts-slider'), true);
+    slider.addEventListener('change', (event) => onInput(event, 'shorts-slider-change'), true);
+
+    sliderWrap.appendChild(inactiveTrack);
+    sliderWrap.appendChild(activeTrack);
+    sliderWrap.appendChild(thumb);
+    sliderWrap.appendChild(slider);
+
+    panel.appendChild(icon);
+    panel.appendChild(sliderWrap);
+    panel.appendChild(label);
+
+    state.shortsVolumeSliderEl = slider;
+    state.shortsVolumeActiveTrackEl = activeTrack;
+    state.shortsVolumeThumbEl = thumb;
+    state.shortsVolumeLabelEl = label;
+
+    updateShortsVolumeWidgetVisual(slider.value);
+
+    return panel;
+  }
+
+  function ensureShortsVolumePanel() {
+    if (!CONFIG.shortsVolumeControlEnabled || !isShortsPage()) return null;
+
+    try {
+      if (!state.shortsVolumePanelEl) {
+        state.shortsVolumePanelEl = createShortsVolumePanel();
+      }
+
+      const root = document.body || document.documentElement;
+
+      if (state.shortsVolumePanelEl.parentNode !== root) {
+        root.appendChild(state.shortsVolumePanelEl);
+      }
+
+      updateVolumeControl();
+      return state.shortsVolumePanelEl;
+    } catch {
+      return null;
+    }
+  }
+
+  function showShortsVolumePanel() {
+    const panel = ensureShortsVolumePanel();
+    if (!panel) return;
+
+    try {
+      panel.style.display = 'flex';
+      updateVolumeControl();
+      syncStoredVolumeToAllVideos('shorts-volume-panel', true);
+
+      clearTimeout(state.shortsVolumeHideTimer);
+      state.shortsVolumeHideTimer = setTimeout(hideShortsVolumePanel, CONFIG.shortsVolumePanelAutoHideMs);
+    } catch {}
+  }
+
+  function hideShortsVolumePanel() {
+    try {
+      clearTimeout(state.shortsVolumeHideTimer);
+
+      if (state.shortsVolumePanelEl) {
+        state.shortsVolumePanelEl.style.display = 'none';
+      }
+    } catch {}
+  }
+
+  function toggleShortsVolumePanel() {
+    try {
+      const panel = ensureShortsVolumePanel();
+
+      if (!panel || panel.style.display === 'flex') {
+        hideShortsVolumePanel();
+        return;
+      }
+
+      showShortsVolumePanel();
+    } catch {}
+  }
+
+  function attachShortsVolumeToActionBar() {
+    if (!CONFIG.shortsVolumeControlEnabled) return false;
+
+    try {
+      const actionBar = getShortsActionBarRoot();
+      if (!actionBar) return false;
+
+      if (!state.shortsVolumeSlotEl) {
+        state.shortsVolumeSlotEl = createShortsVolumeSlot();
+      }
+
+      if (state.shortsVolumeSlotEl.parentNode !== actionBar) {
+        if (state.shortsBanButtonEl && state.shortsBanButtonEl.parentNode === actionBar) {
+          actionBar.insertBefore(state.shortsVolumeSlotEl, state.shortsBanButtonEl);
+        } else {
+          actionBar.appendChild(state.shortsVolumeSlotEl);
+        }
+      }
+
+      state.shortsVolumeSlotEl.style.display = 'inline-flex';
+      state.shortsVolumeSlotEl.dataset.cuShortsVolumePlacement = 'action-bar';
+
+      ensureShortsVolumePanel();
+      updateVolumeControl();
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function ensureShortsVolumeControl() {
+    if (!CONFIG.volumeControlEnabled || !CONFIG.shortsVolumeControlEnabled) return;
+
+    if (!isShortsPage()) {
+      hideShortsVolumeControl();
+      return;
+    }
+
+    attachShortsVolumeToActionBar();
+  }
+
+  function hideShortsVolumeControl() {
+    try {
+      if (state.shortsVolumeSlotEl) {
+        state.shortsVolumeSlotEl.style.display = 'none';
+      }
+
+      hideShortsVolumePanel();
+    } catch {}
+  }
+
+  function syncShortsVolumeControl() {
+    if (isShortsPage()) {
+      ensureShortsVolumeControl();
+    } else {
+      hideShortsVolumeControl();
+    }
+  }
+
+
+
   function syncShortsBanButton() {
     if (isShortsPage()) {
       ensureShortsBanButton();
+      syncShortsVolumeControl();
     } else {
       hideShortsBanButton();
+      hideShortsVolumeControl();
     }
   }
 
@@ -5363,13 +5910,42 @@ html.${APP_ID}-fs-active body {
     Мини-диагностика из консоли:
     window.cuDebug()
   */
+
+  window.cuSetVolume = function cuSetVolume(sliderPercent) {
+    const value = normalizeVolumePercent(sliderPercent);
+    setVideoVolumePercent(value, 'console');
+    return {
+      slider: value,
+      actual: sliderPercentToActualVolumePercent(value),
+      stored: readStoredVolumePercent(),
+    };
+  };
+
+  window.cuVolumeInfo = function cuVolumeInfo() {
+    const slider = readStoredVolumePercent() ?? CONFIG.volumeDefaultPercent;
+
+    return {
+      slider,
+      actual: sliderPercentToActualVolumePercent(slider),
+      curveEnabled: CONFIG.volumeComfortCurveEnabled,
+      exponent: getVolumeCurveExponent(),
+      activeSlider: getVideoVolumePercent(getVideo()),
+      activeActual: getVideoActualVolumePercent(getVideo()),
+      videos: getAllVideos().length,
+      shortsVolumeControlVisible: Boolean(state.shortsVolumeSlotEl && state.shortsVolumeSlotEl.style.display !== 'none'),
+      shortsVolumePanelVisible: Boolean(state.shortsVolumePanelEl && state.shortsVolumePanelEl.style.display === 'flex'),
+      lastSync: state.lastVolumeSyncResult,
+    };
+  };
+
+
   window.cuDebug = function cuDebug() {
     const video = getVideo();
     const player = getPlayer();
 
     return {
       app: APP_SHORT,
-      version: '0.3.12',
+      version: '0.3.13',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -5387,11 +5963,18 @@ html.${APP_ID}-fs-active body {
       customControlsDimOpacity: CONFIG.customControlsDimOpacity,
       volumeControlEnabled: CONFIG.volumeControlEnabled,
       volumePercent: getVideoVolumePercent(video),
+      volumeActualPercent: getVideoActualVolumePercent(video),
       storedVolumePercent: readStoredVolumePercent(),
+      volumeComfortCurveEnabled: CONFIG.volumeComfortCurveEnabled,
+      volumeCurveExponent: getVolumeCurveExponent(),
       volumeSyncAllVideos: CONFIG.volumeSyncAllVideos,
       videosCount: getAllVideos().length,
-      activeVideoVolumePercent: getVideoVolumePercent(getVideo()),
+      activeVideoSliderPercent: getVideoVolumePercent(getVideo()),
+      activeVideoActualPercent: getVideoActualVolumePercent(getVideo()),
       storedVolumePercentNow: readStoredVolumePercent(),
+      storedVolumeActualPercentNow: sliderPercentToActualVolumePercent(readStoredVolumePercent() ?? CONFIG.volumeDefaultPercent),
+      shortsVolumeControlVisible: Boolean(state.shortsVolumeSlotEl && state.shortsVolumeSlotEl.style.display !== 'none'),
+      shortsVolumePanelVisible: Boolean(state.shortsVolumePanelEl && state.shortsVolumePanelEl.style.display === 'flex'),
       lastVolumeSyncResult: state.lastVolumeSyncResult,
       hasVolumeSlider: Boolean(state.volumeSliderEl),
       hasVolumeTrack: Boolean(state.volumeActiveTrackEl),
