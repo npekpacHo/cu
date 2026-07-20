@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home safe-mode, race-safe Shorts blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, safe-mode главной, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home poop safe-mode, race-safe Shorts blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.10
+// @version      0.3.11
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -291,6 +291,19 @@
     homeSafeModeDisableShortsModules: true,
     homeSafeModeHosts: ['m.youtube.com', 'www.youtube.com'],
     homeSafeModePaths: ['/', '/feed/recommended'],
+
+    /*
+      0.3.11:
+      возвращаем 💩 на главную, но в безопасном режиме.
+      Только лёгкая обработка карточек, без тяжёлых модулей плеера и без лавины
+      сканов на каждую mutation-волну.
+    */
+    homePoopEnabled: true,
+    homePoopScanDelayMs: 900,
+    homePoopMutationDelayMs: 2200,
+    homePoopMaxCardsPerScan: 36,
+    homePoopHideBannedCards: true,
+    homePoopNegativeFeedback: false,
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -327,6 +340,8 @@
     fullscreenLayoutFixTimerIds: [],
     homeChipsTimer: 0,
     channelFilterTimer: 0,
+    homePoopTimer: 0,
+    lastHomePoopResult: null,
     shortsBanButtonEl: null,
     blockedShortsTimer: 0,
     lastBlockedShortsSkipAtMs: 0,
@@ -639,6 +654,10 @@
     if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableChannelFilter) return false;
 
     return isShortsPage() || isSourceShortsPage() || isWatchLikePage() || /^(\/results|\/search|\/channel\/|\/@|\/c\/|\/user\/)/.test(location.pathname);
+  }
+
+  function shouldRunHomePoopTasks() {
+    return Boolean(CONFIG.homePoopEnabled && isHomeSafeModePage());
   }
 
   function shouldRunVolumeSyncTasks() {
@@ -4743,6 +4762,105 @@ html.${APP_ID}-fs-active body {
   };
 
 
+
+  function getHomePoopCards() {
+    try {
+      if (!shouldRunHomePoopTasks()) return [];
+
+      const selector = getChannelCardSelector();
+      const cards = Array.from(document.querySelectorAll(selector));
+
+      return cards
+        .filter((card) => {
+          if (!card || card.dataset.cuHomePoopSkip === '1') return false;
+          if (card.closest?.('ytd-popup-container, tp-yt-paper-dialog, ytm-bottom-sheet-renderer')) return false;
+
+          const link = getVideoLinkFromCard(card);
+          if (!link) return false;
+
+          /*
+            На главной берём только карточки видео/Shorts. Никаких active player,
+            никаких video-элементов и прочего тяжёлого хозяйства.
+          */
+          const href = link.getAttribute('href') || link.href || '';
+          return /\/watch\?|\/shorts\//.test(href);
+        })
+        .slice(0, CONFIG.homePoopMaxCardsPerScan);
+    } catch {
+      return [];
+    }
+  }
+
+  function processHomePoop(reason = 'home-poop') {
+    if (!shouldRunHomePoopTasks()) return null;
+
+    try {
+      ensureChannelFilterStyle();
+
+      const cards = getHomePoopCards();
+      const bannedMap = getBannedChannelMap();
+
+      let buttons = 0;
+      let hidden = 0;
+      let scanned = 0;
+
+      for (const card of cards) {
+        scanned += 1;
+
+        const info = extractChannelInfo(card);
+
+        if (info && CONFIG.homePoopHideBannedCards && isChannelBanned(info, bannedMap)) {
+          hideChannelCard(card, info);
+          hidden += 1;
+          continue;
+        }
+
+        restoreChannelCard(card);
+        ensureBanButton(card);
+
+        if (card.querySelector?.(`.${APP_ID}-channel-ban-button`)) {
+          buttons += 1;
+        }
+      }
+
+      state.lastHomePoopResult = {
+        reason,
+        scanned,
+        buttons,
+        hidden,
+        at: new Date().toISOString(),
+      };
+
+      log('home poop processed', state.lastHomePoopResult);
+      return state.lastHomePoopResult;
+    } catch (error) {
+      state.lastHomePoopResult = {
+        reason,
+        error: String(error && error.message ? error.message : error),
+        at: new Date().toISOString(),
+      };
+
+      log('home poop failed', state.lastHomePoopResult);
+      return state.lastHomePoopResult;
+    }
+  }
+
+  function scheduleHomePoop(reason = 'scheduled', delay = CONFIG.homePoopScanDelayMs) {
+    if (!shouldRunHomePoopTasks()) return;
+
+    clearTimeout(state.homePoopTimer);
+    state.homePoopTimer = setTimeout(() => processHomePoop(reason), delay);
+  }
+
+  window.cuProcessHomePoop = function cuProcessHomePoop() {
+    return processHomePoop('manual-console');
+  };
+
+  window.cuLastHomePoop = function cuLastHomePoop() {
+    return state.lastHomePoopResult;
+  };
+
+
   function processChannelCards(reason = 'process') {
     if (!CONFIG.channelFilterEnabled) return;
 
@@ -4844,6 +4962,10 @@ html.${APP_ID}-fs-active body {
 
     scheduleHomeChipsCleanup(reason);
 
+    if (shouldRunHomePoopTasks()) {
+      scheduleHomePoop(reason);
+    }
+
     if (shouldRunChannelFilterTasks()) {
       scheduleChannelFilter(reason);
     }
@@ -4898,6 +5020,7 @@ html.${APP_ID}-fs-active body {
         */
         if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableMutationHeavyTasks) {
           scheduleHomeChipsCleanup('mutation-home-safe');
+          scheduleHomePoop('mutation-home-safe', CONFIG.homePoopMutationDelayMs);
           return;
         }
 
@@ -4908,6 +5031,10 @@ html.${APP_ID}-fs-active body {
         }
 
         scheduleHomeChipsCleanup('mutation');
+
+        if (shouldRunHomePoopTasks()) {
+          scheduleHomePoop('mutation', CONFIG.homePoopMutationDelayMs);
+        }
 
         if (shouldRunChannelFilterTasks()) {
           scheduleChannelFilter('mutation');
@@ -4935,7 +5062,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.10',
+      version: '0.3.11',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -4972,8 +5099,11 @@ html.${APP_ID}-fs-active body {
       homePage: isHomePage(),
       homeSafeModePage: isHomeSafeModePage(),
       shouldRunHeavyPlayerTasks: shouldRunHeavyPlayerTasks(),
+      shouldRunHomePoopTasks: shouldRunHomePoopTasks(),
       shouldRunChannelFilterTasks: shouldRunChannelFilterTasks(),
       shouldRunVolumeSyncTasks: shouldRunVolumeSyncTasks(),
+      homePoopEnabled: CONFIG.homePoopEnabled,
+      lastHomePoopResult: state.lastHomePoopResult,
       homeChipsCleanupEnabled: CONFIG.homeChipsCleanupEnabled,
       channelFilterEnabled: CONFIG.channelFilterEnabled,
       shortsPage: isShortsPage(),
@@ -5037,6 +5167,10 @@ html.${APP_ID}-fs-active body {
 
     scheduleHomeChipsCleanup('init');
 
+    if (shouldRunHomePoopTasks()) {
+      scheduleHomePoop('init');
+    }
+
     if (shouldRunChannelFilterTasks()) {
       scheduleChannelFilter('init');
     }
@@ -5060,6 +5194,10 @@ html.${APP_ID}-fs-active body {
         }
 
         scheduleHomeChipsCleanup('visibility');
+
+        if (shouldRunHomePoopTasks()) {
+          scheduleHomePoop('visibility');
+        }
 
         if (shouldRunChannelFilterTasks()) {
           scheduleChannelFilter('visibility');
