@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home poop safe-mode, race-safe Shorts blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home card feedback, home poop safe-mode, race-safe Shorts blacklist, synced volume, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, карточный feedback главной, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.11
+// @version      0.3.12
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -303,7 +303,22 @@
     homePoopMutationDelayMs: 2200,
     homePoopMaxCardsPerScan: 36,
     homePoopHideBannedCards: true,
-    homePoopNegativeFeedback: false,
+    homePoopNegativeFeedback: true,
+
+    /*
+      0.3.12:
+      при клике 💩 на карточке главной пробуем отправить штатный feedback YouTube
+      через меню карточки: "Не рекомендовать канал" / "Не интересно".
+      Работает только по клику пользователя, не на mutation.
+    */
+    cardFeedbackEnabled: true,
+    cardFeedbackOnlyHomeSafeMode: true,
+    cardFeedbackOpenMenuDelayMs: 420,
+    cardFeedbackClickDelayMs: 160,
+    cardFeedbackCloseDelayMs: 350,
+    cardFeedbackCooldownMs: 1800,
+    cardFeedbackCloseWrongMenu: true,
+    cardFeedbackPreferDontRecommendChannel: true,
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -342,6 +357,8 @@
     channelFilterTimer: 0,
     homePoopTimer: 0,
     lastHomePoopResult: null,
+    lastCardFeedbackResult: null,
+    cardFeedbackBusyUntilMs: 0,
     shortsBanButtonEl: null,
     blockedShortsTimer: 0,
     lastBlockedShortsSkipAtMs: 0,
@@ -3949,12 +3966,26 @@ html.${APP_ID}-fs-active body {
   function findMenuFeedbackItem() {
     const terms = CONFIG.negativeFeedbackPreferDontRecommendChannel
       ? [
-          ['не рекомендовать видео с этого канала', 'dont recommend channel', "don't recommend channel"],
+          [
+            'не рекомендовать видео с этого канала',
+            'не рекомендовать канал',
+            'не рекомендовать видео этого канала',
+            'dont recommend channel',
+            "don't recommend channel",
+            "don't recommend videos from this channel",
+          ],
           ['не интересно', 'не интересует', 'not interested'],
         ]
       : [
           ['не интересно', 'не интересует', 'not interested'],
-          ['не рекомендовать видео с этого канала', 'dont recommend channel', "don't recommend channel"],
+          [
+            'не рекомендовать видео с этого канала',
+            'не рекомендовать канал',
+            'не рекомендовать видео этого канала',
+            'dont recommend channel',
+            "don't recommend channel",
+            "don't recommend videos from this channel",
+          ],
         ];
 
     const exclude = [
@@ -4160,22 +4191,286 @@ html.${APP_ID}-fs-active body {
     }
   }
 
-  async function sendCardNegativeFeedback(card, info, reason = 'card') {
-    if (!CONFIG.negativeFeedbackEnabled || !CONFIG.negativeFeedbackOnCardBan) return null;
 
-    /*
-      Пока карточки не трогаем по умолчанию: на карточке нет дизлайка,
-      а меню YouTube слишком часто меняет структуру. Функция оставлена как точка расширения.
-    */
+  function shouldRunCardFeedback(card = null, reason = 'card') {
+    if (!CONFIG.cardFeedbackEnabled || !CONFIG.negativeFeedbackEnabled) return false;
+
+    if (Date.now() < state.cardFeedbackBusyUntilMs) return false;
+
+    if (CONFIG.cardFeedbackOnlyHomeSafeMode && !isHomeSafeModePage()) return false;
+
+    if (reason.includes('home') || isHomeSafeModePage()) return true;
+
+    return Boolean(CONFIG.negativeFeedbackOnCardBan);
+  }
+
+  function findCardMenuButton(card) {
+    try {
+      if (!card) return null;
+
+      const nodes = Array.from(
+        card.querySelectorAll?.(
+          [
+            'button',
+            '[role="button"]',
+            'yt-icon-button',
+            'c3-icon-button',
+            '[aria-label]',
+            '[title]',
+          ].join(','),
+        ) || [],
+      );
+
+      const candidates = [];
+
+      for (const node of nodes) {
+        const clickable = getClickableElement(node);
+        if (!clickable || !isElementVisible(clickable)) continue;
+
+        const tag = String(clickable.tagName || '').toLowerCase();
+        const href = clickable.getAttribute?.('href') || clickable.href || '';
+
+        if (tag === 'a' && /\/(watch|shorts|channel\/|@|c\/|user\/)/.test(href)) continue;
+
+        const text = normalizeUiText(getElementUiText(node) || getElementUiText(clickable));
+        const aria = normalizeUiText(
+          [
+            node.getAttribute?.('aria-label'),
+            clickable.getAttribute?.('aria-label'),
+            node.getAttribute?.('title'),
+            clickable.getAttribute?.('title'),
+          ].filter(Boolean).join(' '),
+        );
+
+        const classText = normalizeUiText(
+          [
+            node.className,
+            clickable.className,
+            node.parentElement?.className,
+            clickable.parentElement?.className,
+          ].map((value) => String(value || '')).join(' '),
+        );
+
+        const all = `${text} ${aria} ${classText}`;
+
+        let score = 0;
+
+        if (all.includes('ещё')) score += 70;
+        if (all.includes('еще')) score += 70;
+        if (all.includes('more')) score += 70;
+        if (all.includes('действ')) score += 55;
+        if (all.includes('меню')) score += 55;
+        if (all.includes('menu')) score += 55;
+        if (all.includes('overflow')) score += 45;
+        if (all.includes('options')) score += 45;
+        if (all.includes('kebab')) score += 35;
+        if (clickable.getAttribute?.('aria-haspopup') === 'true') score += 35;
+        if (clickable.closest?.('[class*="menu"], [class*="Menu"], ytm-menu, ytm-menu-renderer')) score += 35;
+
+        const rect = clickable.getBoundingClientRect();
+        const cardRect = card.getBoundingClientRect();
+
+        if (rect.width <= 56 && rect.height <= 56) score += 8;
+        if (rect.left > cardRect.left + cardRect.width * 0.55) score += 12;
+        if (rect.top < cardRect.top + cardRect.height * 0.55) score += 8;
+
+        const excluded =
+          all.includes('поделиться') ||
+          all.includes('share') ||
+          all.includes('комментар') ||
+          all.includes('comment') ||
+          all.includes('нравится') ||
+          all.includes('like') ||
+          all.includes('воспроизвести') ||
+          all.includes('play') ||
+          all.includes('смотреть') ||
+          all.includes('watch');
+
+        if (excluded) score -= 120;
+
+        if (score > 40) {
+          candidates.push({ el: clickable, score, text: all });
+        }
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates[0]?.el || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getOpenYouTubeMenuSurface() {
+    try {
+      return (
+        getOpenYouTubeBottomSheet() ||
+        document.querySelector('ytm-menu-popup-renderer') ||
+        document.querySelector('tp-yt-iron-dropdown') ||
+        document.querySelector('ytd-popup-container') ||
+        document.querySelector('[role="menu"]') ||
+        document.querySelector('[role="dialog"]')
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  function isWrongCardMenuOpen() {
+    try {
+      const surface = getOpenYouTubeMenuSurface();
+      if (!surface) return false;
+
+      const text = normalizeUiText(getElementUiText(surface));
+
+      const hasUsefulFeedback =
+        text.includes('не интересно') ||
+        text.includes('не интересует') ||
+        text.includes('не рекомендовать') ||
+        text.includes('not interested') ||
+        text.includes('dont recommend') ||
+        text.includes("don't recommend");
+
+      if (hasUsefulFeedback) return false;
+
+      const looksLikeMenu =
+        text.includes('сохранить') ||
+        text.includes('добавить') ||
+        text.includes('плейлист') ||
+        text.includes('поделиться') ||
+        text.includes('пожаловаться') ||
+        text.includes('описание') ||
+        text.includes('субтитры') ||
+        text.includes('save') ||
+        text.includes('playlist') ||
+        text.includes('share') ||
+        text.includes('report') ||
+        text.includes('description') ||
+        text.includes('captions');
+
+      return looksLikeMenu;
+    } catch {
+      return false;
+    }
+  }
+
+  function closeCardMenu(reason = 'card-menu') {
+    try {
+      if (closeYouTubeBottomSheet(reason)) return true;
+
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+      document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function clickCardMenuFeedback(card, info, reason = 'card') {
+    if (!shouldRunCardFeedback(card, reason)) {
+      return {
+        status: 'disabled',
+        reason,
+        at: new Date().toISOString(),
+      };
+    }
+
+    state.cardFeedbackBusyUntilMs = Date.now() + CONFIG.cardFeedbackCooldownMs;
+
     const result = {
       reason,
       type: 'card',
       channel: info?.name || info?.url || '',
+      videoId: getVideoIdFromCard(card),
+      menu: '',
+      clickedText: '',
       at: new Date().toISOString(),
-      status: 'disabled-by-default',
     };
 
+    try {
+      const menuButton = findCardMenuButton(card);
+
+      if (!menuButton) {
+        result.status = 'menu-not-found';
+        return result;
+      }
+
+      if (!safeClickElement(menuButton, 'card-menu')) {
+        result.status = 'menu-click-failed';
+        return result;
+      }
+
+      await sleep(CONFIG.cardFeedbackOpenMenuDelayMs);
+
+      const item = findMenuFeedbackItem();
+
+      if (!item) {
+        if (CONFIG.cardFeedbackCloseWrongMenu && isWrongCardMenuOpen()) {
+          closeCardMenu('wrong-card-menu');
+          result.status = 'wrong-menu-closed';
+          return result;
+        }
+
+        result.status = 'feedback-item-not-found';
+        closeCardMenu('no-card-feedback-item');
+        return result;
+      }
+
+      const text = normalizeUiText(getElementUiText(item));
+      result.clickedText = text;
+
+      await sleep(CONFIG.cardFeedbackClickDelayMs);
+
+      if (!safeClickElement(item, 'card-menu-feedback')) {
+        result.status = 'feedback-click-failed';
+        closeCardMenu('card-feedback-click-failed');
+        return result;
+      }
+
+      if (text.includes('не рекомендовать') || text.includes('dont recommend') || text.includes("don't recommend")) {
+        result.status = 'dont-recommend-channel';
+      } else if (text.includes('не интересно') || text.includes('не интересует') || text.includes('not interested')) {
+        result.status = 'not-interested';
+      } else {
+        result.status = 'clicked';
+      }
+
+      setTimeout(() => closeCardMenu('after-card-feedback'), CONFIG.cardFeedbackCloseDelayMs);
+
+      return result;
+    } catch (error) {
+      result.status = 'error';
+      result.error = String(error && error.message ? error.message : error);
+      closeCardMenu('card-feedback-error');
+      return result;
+    }
+  }
+
+
+  async function sendCardNegativeFeedback(card, info, reason = 'card') {
+    if (!CONFIG.negativeFeedbackEnabled) return null;
+
+    const result = await clickCardMenuFeedback(card, info, reason);
+
+    state.lastCardFeedbackResult = result;
     state.lastNegativeFeedbackResult = result;
+
+    const good =
+      result &&
+      (
+        result.status === 'dont-recommend-channel' ||
+        result.status === 'not-interested' ||
+        result.status === 'clicked'
+      );
+
+    if (good) {
+      toast(`${APP_SHORT}: сигнал YouTube отправлен`, CONFIG.negativeFeedbackToastMs);
+    } else if (result && result.status === 'wrong-menu-closed') {
+      toast(`${APP_SHORT}: не то меню, закрыто`, 850);
+    } else if (result && result.status !== 'disabled') {
+      log('card feedback skipped', result);
+    }
+
     return result;
   }
 
@@ -4277,8 +4572,16 @@ html.${APP_ID}-fs-active body {
             videoId: getVideoIdFromCard(currentCard),
           }, didBan);
 
-          if (didBan && CONFIG.negativeFeedbackOnCardBan) {
-            sendCardNegativeFeedback(currentCard, info, 'card-ban');
+          const cardReason = isHomeSafeModePage() ? 'home-card-ban' : 'card-ban';
+          const shouldSendCardFeedback =
+            didBan &&
+            (
+              CONFIG.negativeFeedbackOnCardBan ||
+              (CONFIG.homePoopNegativeFeedback && shouldRunCardFeedback(currentCard, cardReason))
+            );
+
+          if (shouldSendCardFeedback) {
+            sendCardNegativeFeedback(currentCard, info, cardReason);
             setTimeout(() => hideChannelCard(currentCard, info), CONFIG.negativeFeedbackHideCardDelayMs);
           } else {
             hideChannelCard(currentCard, info);
@@ -4860,6 +5163,10 @@ html.${APP_ID}-fs-active body {
     return state.lastHomePoopResult;
   };
 
+  window.cuLastCardFeedback = function cuLastCardFeedback() {
+    return state.lastCardFeedbackResult;
+  };
+
 
   function processChannelCards(reason = 'process') {
     if (!CONFIG.channelFilterEnabled) return;
@@ -5062,7 +5369,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.11',
+      version: '0.3.12',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -5103,7 +5410,11 @@ html.${APP_ID}-fs-active body {
       shouldRunChannelFilterTasks: shouldRunChannelFilterTasks(),
       shouldRunVolumeSyncTasks: shouldRunVolumeSyncTasks(),
       homePoopEnabled: CONFIG.homePoopEnabled,
+      homePoopNegativeFeedback: CONFIG.homePoopNegativeFeedback,
+      cardFeedbackEnabled: CONFIG.cardFeedbackEnabled,
       lastHomePoopResult: state.lastHomePoopResult,
+      lastCardFeedbackResult: state.lastCardFeedbackResult,
+      cardFeedbackBusy: Date.now() < state.cardFeedbackBusyUntilMs,
       homeChipsCleanupEnabled: CONFIG.homeChipsCleanupEnabled,
       channelFilterEnabled: CONFIG.channelFilterEnabled,
       shortsPage: isShortsPage(),
