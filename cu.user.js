@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, race-safe Shorts blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, home safe-mode, race-safe Shorts blacklist, synced volume, action-bar poop button, safe negative Shorts feedback, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, safe-mode главной, защита от гонки Shorts, проверяемый ЧС каналов Shorts, синхронная громкость, какашечная кнопка в action bar, безопасный негативный feedback по Shorts, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.9
+// @version      0.3.10
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -276,6 +276,21 @@
 
     showToasts: true,
     debug: false,
+
+    /*
+      0.3.10:
+      аварийный safe-mode для главной YouTube.
+      На реальном мобильном Chrome главная при активном скрипте могла уходить
+      в бесконечную перезагрузку. Поэтому на home-страницах не запускаем тяжёлые
+      модули Shorts/ЧС/volume-mutation, пока пользователь не перешёл на watch/shorts.
+    */
+    homeSafeModeEnabled: true,
+    homeSafeModeDisableMutationHeavyTasks: true,
+    homeSafeModeDisableChannelFilter: true,
+    homeSafeModeDisableVolumeSync: true,
+    homeSafeModeDisableShortsModules: true,
+    homeSafeModeHosts: ['m.youtube.com', 'www.youtube.com'],
+    homeSafeModePaths: ['/', '/feed/recommended'],
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -583,6 +598,55 @@
     }
   }
 
+  function isSupportedYouTubeHost() {
+    try {
+      return CONFIG.homeSafeModeHosts.includes(location.hostname);
+    } catch {
+      return true;
+    }
+  }
+
+  function isHomeSafeModePage() {
+    if (!CONFIG.homeSafeModeEnabled) return false;
+
+    try {
+      if (!isSupportedYouTubeHost()) return false;
+
+      const path = location.pathname.replace(/\/+$/, '') || '/';
+
+      if (!CONFIG.homeSafeModePaths.includes(path)) return false;
+      if (isWatchLikePage() || isShortsPage() || isSourceShortsPage()) return false;
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function shouldRunHeavyPlayerTasks() {
+    if (isHomeSafeModePage()) return false;
+
+    return isWatchLikePage() || isShortsPage() || isSourceShortsPage() || Boolean(getVideo());
+  }
+
+  function shouldRunShortsTasks() {
+    if (isHomeSafeModePage()) return false;
+
+    return isShortsPage() || isSourceShortsPage();
+  }
+
+  function shouldRunChannelFilterTasks() {
+    if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableChannelFilter) return false;
+
+    return isShortsPage() || isSourceShortsPage() || isWatchLikePage() || /^(\/results|\/search|\/channel\/|\/@|\/c\/|\/user\/)/.test(location.pathname);
+  }
+
+  function shouldRunVolumeSyncTasks() {
+    if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableVolumeSync) return false;
+
+    return shouldRunHeavyPlayerTasks();
+  }
+
   function categoryLabel(category) {
     const labels = {
       sponsor: 'спонсорская вставка',
@@ -860,6 +924,8 @@
   }
 
   function scheduleRefresh(reason = 'scheduled') {
+    if (!shouldRunHeavyPlayerTasks()) return;
+
     clearTimeout(state.refreshTimer);
     state.refreshTimer = setTimeout(() => refreshSegments(reason), 250);
   }
@@ -935,6 +1001,8 @@
   }
 
   function scheduleBind() {
+    if (isHomeSafeModePage()) return;
+
     clearTimeout(state.bindTimer);
     state.bindTimer = setTimeout(bindVideo, 120);
   }
@@ -1771,6 +1839,7 @@ html.${APP_ID}-fs-active body {
 
   function scheduleVolumeSync(reason = 'scheduled', force = false, delay = CONFIG.volumeSyncDebounceMs) {
     if (!CONFIG.volumeControlEnabled || !CONFIG.volumeSyncAllVideosOnMutation) return;
+    if (!shouldRunVolumeSyncTasks()) return;
 
     clearTimeout(state.volumeSyncTimer);
     state.volumeSyncTimer = setTimeout(() => syncStoredVolumeToAllVideos(reason, force), delay);
@@ -4659,6 +4728,7 @@ html.${APP_ID}-fs-active body {
 
   function scheduleBlockedShortsCheck(reason = 'scheduled', delay = CONFIG.shortsSkipBannedDelayMs) {
     if (!CONFIG.shortsSkipBannedChannelsEnabled) return;
+    if (!shouldRunShortsTasks()) return;
 
     clearTimeout(state.blockedShortsTimer);
     state.blockedShortsTimer = setTimeout(() => processBlockedShorts(reason), delay);
@@ -4727,6 +4797,7 @@ html.${APP_ID}-fs-active body {
 
   function scheduleChannelFilter(reason = 'scheduled') {
     if (!CONFIG.channelFilterEnabled) return;
+    if (!shouldRunChannelFilterTasks()) return;
 
     clearTimeout(state.channelFilterTimer);
     state.channelFilterTimer = setTimeout(() => processChannelCards(reason), CONFIG.channelBanScanDelayMs);
@@ -4761,12 +4832,25 @@ html.${APP_ID}-fs-active body {
     syncShortsBanButton();
 
     scheduleBind();
-    scheduleVolumeSync(reason, true);
-    scheduleRefresh(reason);
-    syncFullscreenSoon(reason);
+
+    if (shouldRunVolumeSyncTasks()) {
+      scheduleVolumeSync(reason, true);
+    }
+
+    if (shouldRunHeavyPlayerTasks()) {
+      scheduleRefresh(reason);
+      syncFullscreenSoon(reason);
+    }
+
     scheduleHomeChipsCleanup(reason);
-    scheduleChannelFilter(reason);
-    scheduleBlockedShortsCheck(reason);
+
+    if (shouldRunChannelFilterTasks()) {
+      scheduleChannelFilter(reason);
+    }
+
+    if (shouldRunShortsTasks()) {
+      scheduleBlockedShortsCheck(reason);
+    }
   }
 
   function installRouteWatchers() {
@@ -4801,14 +4885,36 @@ html.${APP_ID}-fs-active body {
       if (!document.documentElement) return;
 
       state.observer = new MutationObserver(() => {
-        scheduleBind();
-        scheduleVolumeSync('mutation');
-        scheduleHomeChipsCleanup('mutation');
-        scheduleChannelFilter('mutation');
-        scheduleBlockedShortsCheck('mutation');
-
         if (location.href !== state.currentUrl) {
           onUrlMaybeChanged('mutation-url');
+          return;
+        }
+
+        /*
+          На главной мобильного YouTube MutationObserver может получать лавину
+          изменений ещё до стабилизации приложения. В 0.3.9 тяжёлые задачи могли
+          подливать масла в этот bootstrap-пожар. На home оставляем только лёгкую
+          чистку чипов, без обхода карточек, Shorts и всех video.
+        */
+        if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableMutationHeavyTasks) {
+          scheduleHomeChipsCleanup('mutation-home-safe');
+          return;
+        }
+
+        scheduleBind();
+
+        if (shouldRunVolumeSyncTasks()) {
+          scheduleVolumeSync('mutation');
+        }
+
+        scheduleHomeChipsCleanup('mutation');
+
+        if (shouldRunChannelFilterTasks()) {
+          scheduleChannelFilter('mutation');
+        }
+
+        if (shouldRunShortsTasks()) {
+          scheduleBlockedShortsCheck('mutation');
         }
       });
 
@@ -4829,7 +4935,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.9',
+      version: '0.3.10',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -4864,6 +4970,10 @@ html.${APP_ID}-fs-active body {
       shouldShowFullscreenHint: shouldShowFullscreenHint(),
       fullscreenHintScale: CONFIG.fullscreenHintScale,
       homePage: isHomePage(),
+      homeSafeModePage: isHomeSafeModePage(),
+      shouldRunHeavyPlayerTasks: shouldRunHeavyPlayerTasks(),
+      shouldRunChannelFilterTasks: shouldRunChannelFilterTasks(),
+      shouldRunVolumeSyncTasks: shouldRunVolumeSyncTasks(),
       homeChipsCleanupEnabled: CONFIG.homeChipsCleanupEnabled,
       channelFilterEnabled: CONFIG.channelFilterEnabled,
       shortsPage: isShortsPage(),
@@ -4915,23 +5025,49 @@ html.${APP_ID}-fs-active body {
     installMutationObserver();
 
     scheduleBind();
-    scheduleVolumeSync('init', true);
-    scheduleRefresh('init');
-    syncFullscreenSoon('init');
+
+    if (shouldRunVolumeSyncTasks()) {
+      scheduleVolumeSync('init', true);
+    }
+
+    if (shouldRunHeavyPlayerTasks()) {
+      scheduleRefresh('init');
+      syncFullscreenSoon('init');
+    }
+
     scheduleHomeChipsCleanup('init');
-    scheduleChannelFilter('init');
-    scheduleBlockedShortsCheck('init');
+
+    if (shouldRunChannelFilterTasks()) {
+      scheduleChannelFilter('init');
+    }
+
+    if (shouldRunShortsTasks()) {
+      scheduleBlockedShortsCheck('init');
+    }
 
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         scheduleBind();
-        scheduleRefresh('visibility');
-        syncFullscreenSoon('visibility');
-        syncCustomControls('visibility');
-        scheduleVolumeSync('visibility', true);
+
+        if (shouldRunHeavyPlayerTasks()) {
+          scheduleRefresh('visibility');
+          syncFullscreenSoon('visibility');
+          syncCustomControls('visibility');
+        }
+
+        if (shouldRunVolumeSyncTasks()) {
+          scheduleVolumeSync('visibility', true);
+        }
+
         scheduleHomeChipsCleanup('visibility');
-        scheduleChannelFilter('visibility');
-        scheduleBlockedShortsCheck('visibility');
+
+        if (shouldRunChannelFilterTasks()) {
+          scheduleChannelFilter('visibility');
+        }
+
+        if (shouldRunShortsTasks()) {
+          scheduleBlockedShortsCheck('visibility');
+        }
       }
     });
   }
