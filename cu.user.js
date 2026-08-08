@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, ambient Shorts cleanup, no home poop, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, чистка Shorts вне вкладки Shorts, safe-mode главной с 💩, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, native YouTube ad skipper, ambient Shorts cleanup, no home poop, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, нативный пропуск рекламы YouTube, чистка Shorts вне вкладки Shorts, safe-mode главной, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.15
+// @version      0.3.16
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -360,6 +360,23 @@
     homeCleanupHideInlinePreviewOverlays: true,
 
     /*
+      0.3.16:
+      собственный fallback для штатной рекламы YouTube.
+      SponsorBlock занимается встроенными интеграциями автора, а не роликами,
+      которые сам YouTube вставляет перед/внутри видео.
+    */
+    nativeAdSkipEnabled: true,
+    nativeAdSkipPollMs: 250,
+    nativeAdSkipClickButtons: true,
+    nativeAdSkipCloseOverlays: true,
+    nativeAdSkipSpeedupEnabled: true,
+    nativeAdSkipPlaybackRate: 16,
+    nativeAdSkipSeekToEndEnabled: false,
+    nativeAdSkipRequireStrongSignalForSeek: true,
+    nativeAdSkipRestoreDelayMs: 450,
+    nativeAdSkipToast: true,
+
+    /*
       0.3.15:
       Shorts оставляем как отдельный раздел и нижнюю кнопку навигации,
       но вычищаем их из главной, поиска, рекомендаций и прочих лент.
@@ -391,6 +408,12 @@
     boundVideo: null,
     bindTimer: 0,
     refreshTimer: 0,
+
+    nativeAdPollTimer: 0,
+    nativeAdWasActive: false,
+    nativeAdSavedPlaybackRate: 1,
+    nativeAdLastActionAtMs: 0,
+    nativeAdLastResult: null,
 
     lastSkipKey: '',
     lastSkipAtMs: 0,
@@ -753,6 +776,331 @@
 
     return shouldRunHeavyPlayerTasks();
   }
+
+
+  function shouldRunNativeAdSkipTasks() {
+    if (!CONFIG.nativeAdSkipEnabled) return false;
+    if (document.hidden) return false;
+    if (isHomeSafeModePage()) return false;
+    if (isShortsPage() || isSourceShortsPage()) return false;
+
+    return isWatchLikePage() || Boolean(getVideoIdFromPlayerResponse()) || Boolean(getPlayer());
+  }
+
+  function getNativeAdPlayer() {
+    try {
+      return (
+        document.querySelector('#movie_player') ||
+        document.querySelector('.html5-video-player') ||
+        document.querySelector('ytm-player #movie_player') ||
+        document.querySelector('ytm-player') ||
+        null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  function findNativeAdSkipButton(root = document) {
+    const selectors = [
+      '.ytp-ad-skip-button',
+      '.ytp-ad-skip-button-modern',
+      '.ytp-skip-ad-button',
+      '.ytp-ad-skip-button-slot button',
+      'button.ytp-ad-skip-button-modern',
+      'button[data-purpose="video-ad-skip-button"]',
+      '.videoAdUiSkipButton',
+    ];
+
+    try {
+      for (const selector of selectors) {
+        const button = root.querySelector?.(selector) || document.querySelector(selector);
+        if (button && isElementVisible(button)) return button;
+      }
+
+      const candidates = Array.from(
+        (root.querySelectorAll?.('button, [role="button"], a[role="button"]') || []),
+      ).slice(0, 120);
+
+      for (const el of candidates) {
+        if (!isElementVisible(el)) continue;
+
+        const label = normalizeUiText(
+          [
+            el.getAttribute?.('aria-label') || '',
+            el.getAttribute?.('title') || '',
+            el.textContent || '',
+          ].join(' '),
+        );
+
+        if (
+          label.includes('skip ad') ||
+          label.includes('skip ads') ||
+          label.includes('пропустить рекламу') ||
+          label.includes('пропустить объявления') ||
+          label === 'пропустить'
+        ) {
+          return el;
+        }
+      }
+    } catch {}
+
+    return null;
+  }
+
+  function findNativeAdOverlayCloseButton(root = document) {
+    const selectors = [
+      '.ytp-ad-overlay-close-button',
+      '.ytp-ad-feedback-dialog-close-button',
+      '.ytp-ad-overlay-close-container button',
+    ];
+
+    try {
+      for (const selector of selectors) {
+        const button = root.querySelector?.(selector) || document.querySelector(selector);
+        if (button && isElementVisible(button)) return button;
+      }
+    } catch {}
+
+    return null;
+  }
+
+  function getNativeAdSignals() {
+    try {
+      const player = getNativeAdPlayer();
+      const classList = player?.classList;
+
+      const playerAdShowing = Boolean(classList?.contains('ad-showing'));
+      const playerAdInterrupting = Boolean(classList?.contains('ad-interrupting'));
+      const skipButton = findNativeAdSkipButton(player || document);
+      const overlayCloseButton = findNativeAdOverlayCloseButton(player || document);
+
+      const adUi = Boolean(
+        document.querySelector(
+          [
+            '.video-ads.ytp-ad-module',
+            '.ytp-ad-player-overlay',
+            '.ytp-ad-preview-container',
+            '.ytp-ad-text',
+            '.ytp-ad-duration-remaining',
+            '.ytp-ad-time-remaining',
+            '.ytp-ad-persistent-progress-bar-container',
+          ].join(','),
+        ),
+      );
+
+      const strong =
+        playerAdShowing ||
+        playerAdInterrupting ||
+        Boolean(skipButton) ||
+        Boolean(document.querySelector('.ytp-ad-duration-remaining, .ytp-ad-time-remaining'));
+
+      return {
+        player,
+        playerAdShowing,
+        playerAdInterrupting,
+        skipButton,
+        overlayCloseButton,
+        adUi,
+        strong,
+        active: Boolean(strong || (adUi && (playerAdShowing || playerAdInterrupting))),
+      };
+    } catch {
+      return {
+        player: null,
+        playerAdShowing: false,
+        playerAdInterrupting: false,
+        skipButton: null,
+        overlayCloseButton: null,
+        adUi: false,
+        strong: false,
+        active: false,
+      };
+    }
+  }
+
+  function restoreAfterNativeAd(reason = 'ad-end') {
+    if (!state.nativeAdWasActive) return false;
+
+    const video = getVideo();
+
+    try {
+      if (video) {
+        const restoreRate =
+          Number.isFinite(state.nativeAdSavedPlaybackRate) && state.nativeAdSavedPlaybackRate > 0
+            ? state.nativeAdSavedPlaybackRate
+            : 1;
+
+        video.playbackRate = restoreRate;
+        applyStoredVolume(video, true);
+        syncStoredVolumeToAllVideos(`native-ad-restore-${reason}`, true);
+      }
+    } catch {}
+
+    state.nativeAdWasActive = false;
+    state.nativeAdLastResult = {
+      status: 'restored',
+      reason,
+      at: new Date().toISOString(),
+    };
+
+    return true;
+  }
+
+  function runNativeAdSkipCheck(reason = 'poll') {
+    if (!shouldRunNativeAdSkipTasks()) {
+      restoreAfterNativeAd('disabled-context');
+      return null;
+    }
+
+    const signals = getNativeAdSignals();
+
+    if (!signals.active) {
+      if (state.nativeAdWasActive) {
+        setTimeout(() => restoreAfterNativeAd('signals-gone'), CONFIG.nativeAdSkipRestoreDelayMs);
+      }
+      return null;
+    }
+
+    const video = getVideo();
+    const now = Date.now();
+
+    if (!state.nativeAdWasActive) {
+      state.nativeAdWasActive = true;
+      state.nativeAdSavedPlaybackRate =
+        video && Number.isFinite(video.playbackRate) && video.playbackRate > 0 ? video.playbackRate : 1;
+    }
+
+    let clickedSkip = false;
+    let closedOverlay = false;
+    let spedUp = false;
+    let soughtToEnd = false;
+
+    if (
+      CONFIG.nativeAdSkipClickButtons &&
+      signals.skipButton &&
+      now - state.nativeAdLastActionAtMs > 120
+    ) {
+      try {
+        signals.skipButton.click();
+        clickedSkip = true;
+        state.nativeAdLastActionAtMs = now;
+      } catch {}
+    }
+
+    if (CONFIG.nativeAdSkipCloseOverlays && signals.overlayCloseButton) {
+      try {
+        signals.overlayCloseButton.click();
+        closedOverlay = true;
+      } catch {}
+    }
+
+    if (video && signals.strong) {
+      try {
+        video.muted = true;
+
+        if (CONFIG.nativeAdSkipSpeedupEnabled && video.playbackRate < CONFIG.nativeAdSkipPlaybackRate) {
+          video.playbackRate = CONFIG.nativeAdSkipPlaybackRate;
+          spedUp = true;
+        }
+
+        const duration = Number(video.duration);
+        const current = Number(video.currentTime);
+        const canSeek =
+          CONFIG.nativeAdSkipSeekToEndEnabled &&
+          (!CONFIG.nativeAdSkipRequireStrongSignalForSeek || signals.strong) &&
+          Number.isFinite(duration) &&
+          Number.isFinite(current) &&
+          duration > 0.25 &&
+          current < duration - 0.05;
+
+        if (canSeek && (signals.playerAdShowing || signals.playerAdInterrupting) && signals.adUi) {
+          video.currentTime = Math.max(current, duration - 0.03);
+          soughtToEnd = true;
+        }
+      } catch {}
+    }
+
+    const result = {
+      status: 'ad-detected',
+      reason,
+      clickedSkip,
+      closedOverlay,
+      spedUp,
+      soughtToEnd,
+      playerAdShowing: signals.playerAdShowing,
+      playerAdInterrupting: signals.playerAdInterrupting,
+      adUi: signals.adUi,
+      videoDuration: Number.isFinite(video?.duration) ? video.duration : null,
+      videoCurrentTime: Number.isFinite(video?.currentTime) ? video.currentTime : null,
+      at: new Date().toISOString(),
+    };
+
+    state.nativeAdLastResult = result;
+
+    if (
+      CONFIG.nativeAdSkipToast &&
+      (clickedSkip || soughtToEnd) &&
+      now - state.nativeAdLastActionAtMs < 400
+    ) {
+      toast(`${APP_SHORT}: реклама пропущена`, 700);
+    }
+
+    log('native ad check', result);
+    return result;
+  }
+
+  function startNativeAdPoll(reason = 'start') {
+    stopNativeAdPoll('restart');
+
+    if (!shouldRunNativeAdSkipTasks()) return false;
+
+    runNativeAdSkipCheck(reason);
+
+    state.nativeAdPollTimer = window.setInterval(() => {
+      runNativeAdSkipCheck('poll');
+    }, CONFIG.nativeAdSkipPollMs);
+
+    return true;
+  }
+
+  function stopNativeAdPoll(reason = 'stop') {
+    if (state.nativeAdPollTimer) {
+      clearInterval(state.nativeAdPollTimer);
+      state.nativeAdPollTimer = 0;
+    }
+
+    restoreAfterNativeAd(reason);
+  }
+
+  function syncNativeAdPoll(reason = 'sync') {
+    if (shouldRunNativeAdSkipTasks()) {
+      startNativeAdPoll(reason);
+    } else {
+      stopNativeAdPoll(reason);
+    }
+  }
+
+  window.cuNativeAdInfo = function cuNativeAdInfo() {
+    const signals = getNativeAdSignals();
+
+    return {
+      enabled: CONFIG.nativeAdSkipEnabled,
+      shouldRun: shouldRunNativeAdSkipTasks(),
+      pollActive: Boolean(state.nativeAdPollTimer),
+      signals: {
+        playerAdShowing: signals.playerAdShowing,
+        playerAdInterrupting: signals.playerAdInterrupting,
+        hasSkipButton: Boolean(signals.skipButton),
+        hasOverlayCloseButton: Boolean(signals.overlayCloseButton),
+        adUi: signals.adUi,
+        strong: signals.strong,
+        active: signals.active,
+      },
+      lastResult: state.nativeAdLastResult,
+    };
+  };
+
 
   function categoryLabel(category) {
     const labels = {
@@ -1120,6 +1468,7 @@
     updateVolumeControl();
     scheduleRefresh('metadata');
     syncFullscreenSoon('metadata');
+    runNativeAdSkipCheck('metadata');
   }
 
   function onVideoPlay() {
@@ -1129,6 +1478,7 @@
     updateVolumeControl();
     scheduleRefresh('play');
     syncFullscreenSoon('play');
+    runNativeAdSkipCheck('play');
   }
 
   function isLandscape() {
@@ -6363,6 +6713,7 @@ html.${APP_ID}-fs-active body {
     state.lastTap.time = 0;
     hideCustomControls();
     syncShortsBanButton();
+    syncNativeAdPoll(reason);
 
     scheduleBind();
 
@@ -6450,6 +6801,7 @@ html.${APP_ID}-fs-active body {
           return;
         }
 
+        runNativeAdSkipCheck('mutation');
         scheduleBind();
 
         if (shouldRunVolumeSyncTasks()) {
@@ -6526,7 +6878,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.14',
+      version: '0.3.16',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -6621,6 +6973,22 @@ html.${APP_ID}-fs-active body {
       hasCustomControls: Boolean(state.customControlsEl),
       customControlsVisible: Boolean(state.customControlsEl && state.customControlsEl.style.display !== 'none'),
       fullscreenElementTag: (getFullscreenElement() && getFullscreenElement().tagName) || '',
+      nativeAdSkipEnabled: CONFIG.nativeAdSkipEnabled,
+      nativeAdSkipShouldRun: shouldRunNativeAdSkipTasks(),
+      nativeAdPollActive: Boolean(state.nativeAdPollTimer),
+      nativeAdSignals: (() => {
+        const signals = getNativeAdSignals();
+        return {
+          playerAdShowing: signals.playerAdShowing,
+          playerAdInterrupting: signals.playerAdInterrupting,
+          hasSkipButton: Boolean(signals.skipButton),
+          hasOverlayCloseButton: Boolean(signals.overlayCloseButton),
+          adUi: signals.adUi,
+          strong: signals.strong,
+          active: signals.active,
+        };
+      })(),
+      lastNativeAdResult: state.nativeAdLastResult,
       segments: state.segments.length,
       loadedVideoId: state.loadedVideoId,
     };
@@ -6634,6 +7002,7 @@ html.${APP_ID}-fs-active body {
     installFullscreenWatchers();
     installDoubleTapSeek();
     installMutationObserver();
+    syncNativeAdPoll('init');
     ensureHomeCleanupStyle();
     bindHomePreviewStopper();
 
@@ -6672,7 +7041,13 @@ html.${APP_ID}-fs-active body {
     }
 
     document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopNativeAdPoll('hidden');
+        return;
+      }
+
       if (!document.hidden) {
+        syncNativeAdPoll('visibility');
         scheduleBind();
 
         if (shouldRunHeavyPlayerTasks()) {
