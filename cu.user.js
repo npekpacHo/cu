@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Cleaner YouTube mobile: ad/sponsor skipping, Shorts cleanup, volume, fullscreen and channel blacklist.
-// @description:ru Чище мобильный YouTube: пропуск рекламы, уборка лишних Shorts, громкость, fullscreen и ЧС каналов.
+// @description  Cleaner mobile YouTube: ads, SponsorBlock, volume, fullscreen and Shorts blacklist.
+// @description:ru Чище мобильный YouTube: реклама, SponsorBlock, громкость, fullscreen и ЧС Shorts.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.18
+// @version      0.3.19
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -410,8 +410,17 @@
     ambientShortsCleanupKeepDirectShortsPage: true,
 
     // 0.3.18: CSS-only Shorts cleanup; no global DOM scanner.
-    shortsCssCleanupEnabled: true,
+    shortsCssCleanupEnabled: false,
     shortsTransitionGuardMs: 3000,
+
+    /*
+      0.3.19:
+      диагностический safe-mode Shorts.
+      На /shorts КЮ не трогает DOM, видео, громкость, ЧС, fullscreen и SponsorBlock.
+      Сначала добиваемся абсолютно стабильного открытия Shorts, затем возвращаем
+      функции по одной.
+    */
+    shortsSafeModeEnabled: true,
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -769,14 +778,77 @@
     }
   }
 
+
+  function isShortsSafeModePage() {
+    return Boolean(
+      CONFIG.shortsSafeModeEnabled &&
+      (isShortsPage() || isSourceShortsPage())
+    );
+  }
+
+  function stopShortsRuntimeTasks(reason = 'shorts-safe-mode') {
+    try {
+      clearTimeout(state.bindTimer);
+      clearTimeout(state.refreshTimer);
+      clearTimeout(state.volumeSyncTimer);
+      clearTimeout(state.channelFilterTimer);
+      clearTimeout(state.homePoopTimer);
+      clearTimeout(state.homeCleanupTimer);
+      clearTimeout(state.ambientShortsCleanupTimer);
+      clearTimeout(state.blockedShortsTimer);
+      clearTimeout(state.shortsVolumeHideTimer);
+      clearTimeout(state.customControlsHideTimer);
+
+      state.bindTimer = 0;
+      state.refreshTimer = 0;
+      state.volumeSyncTimer = 0;
+      state.channelFilterTimer = 0;
+      state.homePoopTimer = 0;
+      state.homeCleanupTimer = 0;
+      state.ambientShortsCleanupTimer = 0;
+      state.blockedShortsTimer = 0;
+
+      stopNativeAdPoll(reason);
+
+      hideShortsBanButton();
+      hideShortsVolumeControl();
+      hideCustomControls();
+
+      /*
+        Если до перехода был привязан обычный video, отвязываем слушатели.
+        Сам Shorts video здесь вообще не трогаем.
+      */
+      if (state.boundVideo) {
+        try {
+          state.boundVideo.removeEventListener('timeupdate', runSkipCheck);
+          state.boundVideo.removeEventListener('seeking', runSkipCheck);
+          state.boundVideo.removeEventListener('loadedmetadata', onVideoMetadata);
+          state.boundVideo.removeEventListener('play', onVideoPlay);
+          state.boundVideo.removeEventListener('pause', updateCustomControls);
+          state.boundVideo.removeEventListener('timeupdate', updateCustomControls);
+          state.boundVideo.removeEventListener('volumechange', updateVolumeControl);
+        } catch {}
+
+        state.boundVideo = null;
+      }
+
+      log('Shorts safe-mode active:', reason);
+    } catch (error) {
+      log('Shorts safe-mode cleanup failed:', error);
+    }
+  }
+
+
   function shouldRunHeavyPlayerTasks() {
     if (isHomeSafeModePage()) return false;
+    if (isShortsSafeModePage()) return false;
 
-    return isWatchLikePage() || isShortsPage() || isSourceShortsPage() || Boolean(getVideo());
+    return isWatchLikePage() || Boolean(getVideo());
   }
 
   function shouldRunShortsTasks() {
     if (isHomeSafeModePage()) return false;
+    if (isShortsSafeModePage()) return false;
 
     return isShortsPage() || isSourceShortsPage();
   }
@@ -794,6 +866,7 @@
   }
 
   function shouldRunVolumeSyncTasks() {
+    if (isShortsSafeModePage()) return false;
     if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableVolumeSync) return false;
 
     return shouldRunHeavyPlayerTasks();
@@ -1618,6 +1691,7 @@
 
   function scheduleBind() {
     if (isHomeSafeModePage()) return;
+    if (isShortsSafeModePage()) return;
 
     clearTimeout(state.bindTimer);
     state.bindTimer = setTimeout(bindVideo, 120);
@@ -3458,6 +3532,21 @@ html.${APP_ID}-fs-active body {
 
         [data-${APP_ID}-home-clean-hidden="1"],
         [data-${APP_ID}-ambient-shorts-hidden="1"] {
+          display: none !important;
+          visibility: hidden !important;
+        }
+
+        /*
+          Лёгкая уборка очевидных Shorts-полок без :has().
+          Не действует внутри /shorts.
+        */
+        html.${APP_ID}-page-nonshorts ytm-reel-shelf-renderer,
+        html.${APP_ID}-page-nonshorts ytd-reel-shelf-renderer,
+        html.${APP_ID}-page-nonshorts ytm-shorts-lockup-view-model,
+        html.${APP_ID}-page-nonshorts ytm-shorts-lockup-view-model-v2,
+        html.${APP_ID}-page-nonshorts ytm-shorts-lockup-view-model-v3,
+        html.${APP_ID}-page-nonshorts ytm-reel-item-renderer,
+        html.${APP_ID}-page-nonshorts ytd-reel-item-renderer {
           display: none !important;
           visibility: hidden !important;
         }
@@ -6690,6 +6779,21 @@ html.${APP_ID}-fs-active body {
     state.ambientShortsCleanupTimer = setTimeout(() => processAmbientShortsCleanup(reason), delay);
   }
 
+
+  window.cuShortsSafeMode = function cuShortsSafeMode() {
+    return {
+      enabled: CONFIG.shortsSafeModeEnabled,
+      active: isShortsSafeModePage(),
+      pathname: location.pathname,
+      shouldRunHeavyPlayerTasks: shouldRunHeavyPlayerTasks(),
+      shouldRunShortsTasks: shouldRunShortsTasks(),
+      shouldRunVolumeSyncTasks: shouldRunVolumeSyncTasks(),
+      observerInstalled: Boolean(state.observer),
+      boundVideo: Boolean(state.boundVideo),
+    };
+  };
+
+
   window.cuProcessShortsCleanup = function cuProcessShortsCleanup() {
     updateShortsRouteClass('manual-console');
 
@@ -7000,6 +7104,12 @@ html.${APP_ID}-fs-active body {
     state.lastSkipAtMs = 0;
     state.lastTap.time = 0;
     hideCustomControls();
+
+    if (isShortsSafeModePage()) {
+      stopShortsRuntimeTasks(reason);
+      return;
+    }
+
     syncShortsBanButton();
     syncNativeAdPoll(reason);
 
@@ -7068,6 +7178,14 @@ html.${APP_ID}-fs-active body {
       state.observer = new MutationObserver(() => {
         if (location.href !== state.currentUrl) {
           onUrlMaybeChanged('mutation-url');
+          return;
+        }
+
+        /*
+          0.3.19: внутри Shorts MutationObserver КЮ молчит полностью.
+          Никаких кнопок, volume sync, blacklist scans или bindVideo.
+        */
+        if (isShortsSafeModePage()) {
           return;
         }
 
@@ -7157,7 +7275,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.18',
+      version: '0.3.19',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -7211,6 +7329,8 @@ html.${APP_ID}-fs-active body {
       homeCleanupEnabled: CONFIG.homeCleanupEnabled,
       ambientShortsCleanupEnabled: CONFIG.ambientShortsCleanupEnabled,
       shortsCssCleanupEnabled: CONFIG.shortsCssCleanupEnabled,
+      shortsSafeModeEnabled: CONFIG.shortsSafeModeEnabled,
+      shortsSafeModePage: isShortsSafeModePage(),
       shortsRouteClass: document.documentElement?.classList.contains(`${APP_ID}-page-shorts`) ? 'shorts' : 'nonshorts',
       shortsTransitioning: Boolean(document.documentElement?.classList.contains(`${APP_ID}-shorts-transitioning`)),
       homePoopNegativeFeedback: CONFIG.homePoopNegativeFeedback,
@@ -7300,15 +7420,18 @@ html.${APP_ID}-fs-active body {
     syncNativeAdPoll('init');
     ensureHomeCleanupStyle();
     bindHomePreviewStopper();
-    bindShortsTransitionGuard();
 
-    scheduleBind();
+    if (isShortsSafeModePage()) {
+      stopShortsRuntimeTasks('init');
+    } else {
+      scheduleBind();
+    }
 
-    if (shouldRunVolumeSyncTasks()) {
+    if (!isShortsSafeModePage() && shouldRunVolumeSyncTasks()) {
       scheduleVolumeSync('init', true);
     }
 
-    if (shouldRunHeavyPlayerTasks()) {
+    if (!isShortsSafeModePage() && shouldRunHeavyPlayerTasks()) {
       scheduleRefresh('init');
       syncFullscreenSoon('init');
     }
@@ -7327,7 +7450,7 @@ html.${APP_ID}-fs-active body {
       scheduleChannelFilter('init');
     }
 
-    if (shouldRunShortsTasks()) {
+    if (!isShortsSafeModePage() && shouldRunShortsTasks()) {
       syncShortsBanButton();
       scheduleBlockedShortsCheck('init');
     }
@@ -7339,6 +7462,11 @@ html.${APP_ID}-fs-active body {
       }
 
       if (!document.hidden) {
+        if (isShortsSafeModePage()) {
+          stopShortsRuntimeTasks('visibility');
+          return;
+        }
+
         syncNativeAdPoll('visibility');
         scheduleBind();
 
