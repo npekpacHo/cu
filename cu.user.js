@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, native YouTube ad skipper, ambient Shorts cleanup, no home poop, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, нативный пропуск рекламы YouTube, чистка Shorts вне вкладки Shorts, safe-mode главной, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, native YouTube ad skipper, SponsorBlock diagnostics, fullscreen noise cleanup, ambient Shorts cleanup, no home poop, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
+// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, нативный пропуск рекламы YouTube, диагностика SponsorBlock, чистка fullscreen-оверлеев, чистка Shorts вне вкладки Shorts, safe-mode главной, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.16
+// @version      0.3.17
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -55,6 +55,13 @@
 
     cacheTtlMs: 6 * 60 * 60 * 1000,
 
+    /*
+      Пустой список сегментов нельзя считать таким же надёжным, как найденные
+      сегменты. Он мог получиться из старой разметки, временного ответа API или
+      потому что сегмент добавили через минуту после нашего первого запроса.
+    */
+    emptyCacheTtlMs: 5 * 60 * 1000,
+
     skipBeforeStartSec: 0.18,
     skipAfterEndSec: 0.07,
 
@@ -79,6 +86,14 @@
     fullscreenHintWatchPagesOnly: true,
     fullscreenHintHideOnShorts: true,
     fullscreenHintScale: 1.5,
+
+    /*
+      0.3.17:
+      это скрывает YouTube-овские fullscreen overlays/grid/quick actions.
+      Системную плашку Chromium вида "youtube.com is now full screen"
+      страница скрыть не может — она рисуется самим браузером вне DOM.
+    */
+    hideYoutubeFullscreenNoise: true,
 
     exitFullscreenOnPortrait: true,
 
@@ -417,6 +432,8 @@
 
     lastSkipKey: '',
     lastSkipAtMs: 0,
+    lastSponsorBlockFetch: null,
+    lastSponsorBlockError: null,
 
     fsHintEl: null,
     customControlsEl: null,
@@ -1241,7 +1258,9 @@
 
       const item = JSON.parse(raw);
       if (!item || !Array.isArray(item.segments) || !item.time) return null;
-      if (Date.now() - item.time > CONFIG.cacheTtlMs) return null;
+
+      const ttl = item.segments.length ? CONFIG.cacheTtlMs : CONFIG.emptyCacheTtlMs;
+      if (Date.now() - item.time > ttl) return null;
 
       return item.segments;
     } catch {
@@ -1314,32 +1333,90 @@
     return Array.isArray(data) ? data : [];
   }
 
-  async function getSponsorSegments(videoId) {
-    const cached = readCache(videoId);
-    if (cached !== null) return cached;
+  async function getSponsorSegments(videoId, options = {}) {
+    const bypassCache = Boolean(options.bypassCache);
+    const forceDirect = Boolean(options.forceDirect);
+
+    if (!bypassCache) {
+      const cached = readCache(videoId);
+
+      if (cached !== null) {
+        state.lastSponsorBlockFetch = {
+          videoId,
+          source: 'cache',
+          categories: [...CONFIG.categories],
+          segments: cached,
+          count: cached.length,
+          at: new Date().toISOString(),
+        };
+
+        return cached;
+      }
+    }
 
     let raw = null;
+    let source = '';
+    let requestError = null;
 
     try {
-      if (CONFIG.useHashPrefixApi) {
+      if (forceDirect) {
+        raw = await fetchSegmentsDirect(videoId);
+        source = 'direct';
+      } else if (CONFIG.useHashPrefixApi) {
         raw = await fetchSegmentsByHashPrefix(videoId);
+        source = 'hash-prefix';
       }
 
       if (raw === null) {
         raw = await fetchSegmentsDirect(videoId);
+        source = 'direct';
       }
     } catch (error) {
+      requestError = error;
+      state.lastSponsorBlockError = {
+        videoId,
+        message: String(error && error.message ? error.message : error),
+        source: source || (forceDirect ? 'direct' : 'request'),
+        at: new Date().toISOString(),
+      };
       log('SponsorBlock request failed:', error);
-      raw = [];
+    }
+
+    if (requestError) {
+      /*
+        Критично: не кешируем ошибку как "сегментов нет".
+        Иначе один сетевой чих превращается в шесть часов саморекламы.
+      */
+      state.lastSponsorBlockFetch = {
+        videoId,
+        source: source || 'error',
+        categories: [...CONFIG.categories],
+        segments: [],
+        count: 0,
+        error: state.lastSponsorBlockError,
+        at: new Date().toISOString(),
+      };
+
+      return [];
     }
 
     const segments = normalizeSegments(raw);
     writeCache(videoId, segments);
 
+    state.lastSponsorBlockError = null;
+    state.lastSponsorBlockFetch = {
+      videoId,
+      source: source || 'unknown',
+      categories: [...CONFIG.categories],
+      segments,
+      count: segments.length,
+      at: new Date().toISOString(),
+    };
+
     return segments;
   }
 
-  async function refreshSegments(reason = 'refresh') {
+  async function refreshSegments(reason = 'refresh', force = false) {
     const videoId = getVideoIdFromUrl();
 
     if (!videoId) {
@@ -1351,7 +1428,7 @@
       return;
     }
 
-    if (videoId === state.loadedVideoId) return;
+    if (!force && videoId === state.loadedVideoId) return;
 
     const token = ++state.loadToken;
 
@@ -1363,7 +1440,10 @@
 
     log('loading SponsorBlock segments', { videoId, reason });
 
-    const segments = await getSponsorSegments(videoId);
+    const segments = await getSponsorSegments(videoId, {
+      bypassCache: force,
+      forceDirect: force,
+    });
 
     if (token !== state.loadToken) return;
     if (videoId !== getVideoIdFromUrl()) return;
@@ -1377,6 +1457,82 @@
 
     runSkipCheck();
   }
+
+
+  function getSponsorBlockInfo() {
+    const videoId = getVideoIdFromUrl();
+    const byCategory = {};
+
+    for (const segment of state.segments) {
+      byCategory[segment.category] = (byCategory[segment.category] || 0) + 1;
+    }
+
+    return {
+      videoId,
+      categories: [...CONFIG.categories],
+      selfpromoEnabled: CONFIG.categories.includes('selfpromo'),
+      actionTypes: [...ACTION_TYPES],
+      loadedVideoId: state.loadedVideoId,
+      segments: state.segments.map((segment) => ({ ...segment })),
+      byCategory,
+      lastFetch: state.lastSponsorBlockFetch,
+      lastError: state.lastSponsorBlockError,
+      cacheKey: videoId ? cacheKey(videoId) : '',
+      cached: videoId ? readCache(videoId) : null,
+    };
+  }
+
+  window.cuSponsorInfo = function cuSponsorInfo() {
+    return getSponsorBlockInfo();
+  };
+
+  window.cuRefreshSponsorBlock = async function cuRefreshSponsorBlock() {
+    const videoId = getVideoIdFromUrl();
+    if (!videoId) return { ok: false, reason: 'no-video-id' };
+
+    try {
+      localStorage.removeItem(cacheKey(videoId));
+    } catch {}
+
+    state.loadedVideoId = '';
+    await refreshSegments('manual-force', true);
+
+    return {
+      ok: true,
+      ...getSponsorBlockInfo(),
+    };
+  };
+
+  window.cuProbeSponsorBlock = async function cuProbeSponsorBlock() {
+    const videoId = getVideoIdFromUrl();
+    if (!videoId) return { ok: false, reason: 'no-video-id' };
+
+    try {
+      const raw = await fetchSegmentsDirect(videoId);
+      const segments = normalizeSegments(raw);
+      const byCategory = {};
+
+      for (const segment of segments) {
+        byCategory[segment.category] = (byCategory[segment.category] || 0) + 1;
+      }
+
+      return {
+        ok: true,
+        videoId,
+        categories: [...CONFIG.categories],
+        selfpromoEnabled: CONFIG.categories.includes('selfpromo'),
+        segments,
+        byCategory,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        videoId,
+        error: String(error && error.message ? error.message : error),
+      };
+    }
+  };
+
 
   function scheduleRefresh(reason = 'scheduled') {
     if (!shouldRunHeavyPlayerTasks()) return;
@@ -1955,6 +2111,20 @@
       const style = document.createElement('style');
       style.id = `${APP_ID}-fullscreen-layout-style`;
       style.textContent = `
+${CONFIG.hideYoutubeFullscreenNoise ? `
+.html5-video-player.ytp-fullscreen .ytp-fullscreen-quick-actions,
+.html5-video-player.ytp-fullscreen .ytp-fullscreen-grid,
+.html5-video-player.ytp-fullscreen .ytp-fullscreen-grid-expand-button,
+.html5-video-player.ytp-fullscreen .ytp-fullscreen-grid-hover-overlay,
+.html5-video-player.ytp-fullscreen .ytp-fullscreen-grid-hover-overlay-chevron,
+.html5-video-player.ytp-fullscreen .ytp-fullscreen-grid-stills-container {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+` : ''}
+
 html.${APP_ID}-fs-active,
 html.${APP_ID}-fs-active body {
   margin: 0 !important;
@@ -6878,7 +7048,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.16',
+      version: '0.3.17',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -6919,6 +7089,7 @@ html.${APP_ID}-fs-active body {
       fullscreenHintForbiddenPage: isFullscreenHintForbiddenPage(),
       shouldShowFullscreenHint: shouldShowFullscreenHint(),
       fullscreenHintScale: CONFIG.fullscreenHintScale,
+      hideYoutubeFullscreenNoise: CONFIG.hideYoutubeFullscreenNoise,
       homePage: isHomePage(),
       homeSafeModePage: isHomeSafeModePage(),
       shouldRunHeavyPlayerTasks: shouldRunHeavyPlayerTasks(),
@@ -6989,6 +7160,17 @@ html.${APP_ID}-fs-active body {
         };
       })(),
       lastNativeAdResult: state.nativeAdLastResult,
+      sponsorBlockCategories: [...CONFIG.categories],
+      sponsorBlockSelfpromoEnabled: CONFIG.categories.includes('selfpromo'),
+      sponsorBlockLastFetch: state.lastSponsorBlockFetch,
+      sponsorBlockLastError: state.lastSponsorBlockError,
+      sponsorBlockByCategory: (() => {
+        const result = {};
+        for (const segment of state.segments) {
+          result[segment.category] = (result[segment.category] || 0) + 1;
+        }
+        return result;
+      })(),
       segments: state.segments.length,
       loadedVideoId: state.loadedVideoId,
     };
