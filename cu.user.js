@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Skip ads/sponsor blocks (SponsorBlock), fullscreen button on watch pages, dimmed custom controls, remembered custom volume slider, local channel ban for Shorts and cards, native YouTube ad skipper, SponsorBlock diagnostics, fullscreen noise cleanup, ambient Shorts cleanup, no home poop, race-safe Shorts blacklist, comfort volume mixer, Shorts volume button, action-bar poop button, fullscreen layout fix, home chips cleanup and exit fullscreen on portrait rotation for YouTube mobile web
-// @description:ru Пропуск рекламы/спонсорских блоков (SponsorBlock), кнопка fullscreen только на страницах видео, свои полупрозрачные кнопки плеера, запоминаемый кастомный ползунок громкости, локальный бан каналов в Shorts и карточках, нативный пропуск рекламы YouTube, диагностика SponsorBlock, чистка fullscreen-оверлеев, чистка Shorts вне вкладки Shorts, safe-mode главной, защита от гонки Shorts, проверяемый ЧС каналов Shorts, комфортный микшер громкости, кнопка звука в Shorts, какашечная кнопка в action bar, чистка верхних чипов главной и выход из fullscreen при повороте в портрет для мобильной веб-версии YouTube
+// @description  Cleaner YouTube mobile: ad/sponsor skipping, Shorts cleanup, volume, fullscreen and channel blacklist.
+// @description:ru Чище мобильный YouTube: пропуск рекламы, уборка лишних Shorts, громкость, fullscreen и ЧС каналов.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.17
+// @version      0.3.18
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -396,7 +396,7 @@
       Shorts оставляем как отдельный раздел и нижнюю кнопку навигации,
       но вычищаем их из главной, поиска, рекомендаций и прочих лент.
     */
-    ambientShortsCleanupEnabled: true,
+    ambientShortsCleanupEnabled: false,
     ambientShortsCleanupDelayMs: 650,
     ambientShortsCleanupMutationDelayMs: 1400,
     ambientShortsCleanupMaxLinksPerScan: 160,
@@ -408,6 +408,10 @@
     ambientShortsCleanupDisablePreviewAutoplay: true,
     ambientShortsCleanupKeepBottomNav: true,
     ambientShortsCleanupKeepDirectShortsPage: true,
+
+    // 0.3.18: CSS-only Shorts cleanup; no global DOM scanner.
+    shortsCssCleanupEnabled: true,
+    shortsTransitionGuardMs: 3000,
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -466,6 +470,7 @@
     lastHomeCleanupResult: null,
     ambientShortsCleanupTimer: 0,
     lastAmbientShortsCleanupResult: null,
+    shortsTransitionTimer: 0,
     lastCardFeedbackResult: null,
     cardFeedbackBusyUntilMs: 0,
     shortsBanButtonEl: null,
@@ -704,7 +709,7 @@
 
   function isShortsPage() {
     try {
-      return /^\/shorts\//.test(location.pathname);
+      return /^\/shorts(?:\/|$)/.test(location.pathname);
     } catch {
       return false;
     }
@@ -3456,6 +3461,28 @@ html.${APP_ID}-fs-active body {
           display: none !important;
           visibility: hidden !important;
         }
+
+        ${CONFIG.shortsCssCleanupEnabled ? `
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-reel-shelf-renderer,
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytd-reel-shelf-renderer,
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytd-rich-shelf-renderer:has(a[href^="/shorts"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-rich-section-renderer:has(a[href^="/shorts"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytd-rich-section-renderer:has(a[href^="/shorts"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-shorts-lockup-view-model,
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-shorts-lockup-view-model-v2,
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-shorts-lockup-view-model-v3,
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-reel-item-renderer,
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytd-reel-item-renderer,
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-rich-item-renderer:has(a[href^="/shorts/"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytd-rich-item-renderer:has(a[href^="/shorts/"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-video-with-context-renderer:has(a[href^="/shorts/"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytm-compact-video-renderer:has(a[href^="/shorts/"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytd-video-renderer:has(a[href^="/shorts/"]),
+        html.${APP_ID}-page-nonshorts:not(.${APP_ID}-shorts-transitioning) ytd-compact-video-renderer:has(a[href^="/shorts/"]) {
+          display: none !important;
+          visibility: hidden !important;
+        }
+        ` : ''}
       `;
     } catch {}
   }
@@ -6323,6 +6350,84 @@ html.${APP_ID}-fs-active body {
 
 
 
+
+  function clearAmbientShortsCleanupTimer() {
+    try {
+      clearTimeout(state.ambientShortsCleanupTimer);
+      state.ambientShortsCleanupTimer = 0;
+    } catch {}
+  }
+
+  function restoreAmbientShortsHiddenNodes() {
+    try {
+      document.querySelectorAll('[data-cu-ambient-shorts-hidden="1"]').forEach((node) => {
+        try {
+          delete node.dataset.cuAmbientShortsHidden;
+        } catch {}
+      });
+    } catch {}
+  }
+
+  function updateShortsRouteClass(reason = 'route') {
+    try {
+      const root = document.documentElement;
+      if (!root) return;
+
+      const shorts = isShortsPage() || isSourceShortsPage();
+
+      root.classList.toggle(`${APP_ID}-page-shorts`, shorts);
+      root.classList.toggle(`${APP_ID}-page-nonshorts`, !shorts);
+      root.classList.remove(`${APP_ID}-shorts-transitioning`);
+
+      if (shorts) {
+        clearAmbientShortsCleanupTimer();
+        restoreAmbientShortsHiddenNodes();
+      }
+
+      log('shorts route', reason, shorts ? 'shorts' : 'nonshorts');
+    } catch {}
+  }
+
+  function beginShortsTransition(reason = 'shorts-navigation') {
+    try {
+      clearAmbientShortsCleanupTimer();
+      clearTimeout(state.homeCleanupTimer);
+      clearTimeout(state.shortsTransitionTimer);
+
+      document.documentElement?.classList.add(`${APP_ID}-shorts-transitioning`);
+
+      state.shortsTransitionTimer = setTimeout(() => {
+        updateShortsRouteClass(`${reason}-timeout`);
+      }, CONFIG.shortsTransitionGuardMs);
+    } catch {}
+  }
+
+  function bindShortsTransitionGuard() {
+    const handler = (event) => {
+      try {
+        const target = event.target;
+        const anchor = target?.closest?.('a[href]');
+
+        if (anchor && isShortsHref(anchor.getAttribute('href') || anchor.href || '')) {
+          beginShortsTransition('shorts-link');
+          return;
+        }
+
+        const pivot = target?.closest?.('ytm-pivot-bar-item-renderer, ytm-pivot-bar-renderer');
+        if (!pivot) return;
+
+        const text = String(pivot.textContent || '').trim().toLowerCase();
+        if (text.includes('shorts') || text.includes('шортс')) {
+          beginShortsTransition('shorts-bottom-nav');
+        }
+      } catch {}
+    };
+
+    document.addEventListener('pointerdown', handler, true);
+    document.addEventListener('touchstart', handler, true);
+  }
+
+
   function isAllowedShortsPage() {
     if (!CONFIG.ambientShortsCleanupKeepDirectShortsPage) return false;
 
@@ -6361,9 +6466,9 @@ html.${APP_ID}-fs-active body {
   function isShortsHref(href) {
     try {
       const url = new URL(href, location.origin);
-      return /^\/shorts\//.test(url.pathname);
+      return /^\/shorts(?:\/|$)/.test(url.pathname);
     } catch {
-      return /\/shorts\//.test(String(href || ''));
+      return /\/shorts(?:\/|$)/.test(String(href || ''));
     }
   }
 
@@ -6586,7 +6691,15 @@ html.${APP_ID}-fs-active body {
   }
 
   window.cuProcessShortsCleanup = function cuProcessShortsCleanup() {
-    return processAmbientShortsCleanup('manual-console');
+    updateShortsRouteClass('manual-console');
+
+    return {
+      mode: CONFIG.shortsCssCleanupEnabled ? 'css' : 'off',
+      jsScannerEnabled: CONFIG.ambientShortsCleanupEnabled,
+      shortsPage: isShortsPage() || isSourceShortsPage(),
+      transitioning: Boolean(document.documentElement?.classList.contains(`${APP_ID}-shorts-transitioning`)),
+      at: new Date().toISOString(),
+    };
   };
 
   window.cuLastShortsCleanup = function cuLastShortsCleanup() {
@@ -6769,7 +6882,11 @@ html.${APP_ID}-fs-active body {
           if (
             !(
               (CONFIG.homeCleanupDisablePreviewAutoplay && isHomeSafeModePage()) ||
-              (CONFIG.ambientShortsCleanupDisablePreviewAutoplay && shouldRunAmbientShortsCleanupTasks())
+              (
+                CONFIG.ambientShortsCleanupDisablePreviewAutoplay &&
+                !isShortsPage() &&
+                !isSourceShortsPage()
+              )
             )
           ) return;
           if (!target || String(target.tagName || '').toLowerCase() !== 'video') return;
@@ -6875,6 +6992,7 @@ html.${APP_ID}-fs-active body {
     if (href === state.currentUrl) return;
 
     state.currentUrl = href;
+    updateShortsRouteClass(reason);
     state.videoId = '';
     state.loadedVideoId = '';
     state.segments = [];
@@ -6900,10 +7018,6 @@ html.${APP_ID}-fs-active body {
 
     if (shouldRunHomeCleanupTasks()) {
       scheduleHomeCleanup(reason);
-    }
-
-    if (shouldRunAmbientShortsCleanupTasks()) {
-      scheduleAmbientShortsCleanup(reason);
     }
 
     if (shouldRunHomePoopTasks()) {
@@ -6966,7 +7080,6 @@ html.${APP_ID}-fs-active body {
         if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableMutationHeavyTasks) {
           scheduleHomeChipsCleanup('mutation-home-safe');
           scheduleHomeCleanup('mutation-home-safe', CONFIG.homeCleanupMutationDelayMs);
-          scheduleAmbientShortsCleanup('mutation-home-safe', CONFIG.ambientShortsCleanupMutationDelayMs);
           scheduleHomePoop('mutation-home-safe', CONFIG.homePoopMutationDelayMs);
           return;
         }
@@ -6982,10 +7095,6 @@ html.${APP_ID}-fs-active body {
 
         if (shouldRunHomeCleanupTasks()) {
           scheduleHomeCleanup('mutation', CONFIG.homeCleanupMutationDelayMs);
-        }
-
-        if (shouldRunAmbientShortsCleanupTasks()) {
-          scheduleAmbientShortsCleanup('mutation', CONFIG.ambientShortsCleanupMutationDelayMs);
         }
 
         if (shouldRunHomePoopTasks()) {
@@ -7048,7 +7157,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.17',
+      version: '0.3.18',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -7101,6 +7210,9 @@ html.${APP_ID}-fs-active body {
       homePoopEnabled: CONFIG.homePoopEnabled,
       homeCleanupEnabled: CONFIG.homeCleanupEnabled,
       ambientShortsCleanupEnabled: CONFIG.ambientShortsCleanupEnabled,
+      shortsCssCleanupEnabled: CONFIG.shortsCssCleanupEnabled,
+      shortsRouteClass: document.documentElement?.classList.contains(`${APP_ID}-page-shorts`) ? 'shorts' : 'nonshorts',
+      shortsTransitioning: Boolean(document.documentElement?.classList.contains(`${APP_ID}-shorts-transitioning`)),
       homePoopNegativeFeedback: CONFIG.homePoopNegativeFeedback,
       cardFeedbackEnabled: CONFIG.cardFeedbackEnabled,
       lastHomeCleanupResult: state.lastHomeCleanupResult,
@@ -7180,6 +7292,7 @@ html.${APP_ID}-fs-active body {
     state.currentUrl = location.href;
     state.wasLandscape = isLandscape();
 
+    updateShortsRouteClass('init');
     installRouteWatchers();
     installFullscreenWatchers();
     installDoubleTapSeek();
@@ -7187,6 +7300,7 @@ html.${APP_ID}-fs-active body {
     syncNativeAdPoll('init');
     ensureHomeCleanupStyle();
     bindHomePreviewStopper();
+    bindShortsTransitionGuard();
 
     scheduleBind();
 
@@ -7203,10 +7317,6 @@ html.${APP_ID}-fs-active body {
 
     if (shouldRunHomeCleanupTasks()) {
       scheduleHomeCleanup('init');
-    }
-
-    if (shouldRunAmbientShortsCleanupTasks()) {
-      scheduleAmbientShortsCleanup('init');
     }
 
     if (shouldRunHomePoopTasks()) {
@@ -7246,10 +7356,6 @@ html.${APP_ID}-fs-active body {
 
         if (shouldRunHomeCleanupTasks()) {
           scheduleHomeCleanup('visibility');
-        }
-
-        if (shouldRunAmbientShortsCleanupTasks()) {
-          scheduleAmbientShortsCleanup('visibility');
         }
 
         if (shouldRunHomePoopTasks()) {
