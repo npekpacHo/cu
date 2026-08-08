@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Cleaner mobile YouTube: ads, SponsorBlock, volume, fullscreen and Shorts blacklist.
-// @description:ru Чище мобильный YouTube: реклама, SponsorBlock, громкость, fullscreen и ЧС Shorts.
+// @description  Cleaner mobile YouTube: ads, SponsorBlock, synced volume, fullscreen and Shorts blacklist.
+// @description:ru Чище мобильный YouTube: реклама, SponsorBlock, единая громкость, fullscreen и ЧС Shorts.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.19
+// @version      0.3.20
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -421,6 +421,10 @@
       функции по одной.
     */
     shortsSafeModeEnabled: true,
+
+    // 0.3.20: в safe-mode Shorts возвращаем только синхронизацию громкости.
+    shortsSafeVolumeSyncEnabled: true,
+    shortsSafeVolumeSyncDelayMs: 120,
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -480,6 +484,8 @@
     ambientShortsCleanupTimer: 0,
     lastAmbientShortsCleanupResult: null,
     shortsTransitionTimer: 0,
+    shortsSafeVolumeTimer: 0,
+    lastShortsSafeVolumeResult: null,
     lastCardFeedbackResult: null,
     cardFeedbackBusyUntilMs: 0,
     shortsBanButtonEl: null,
@@ -798,6 +804,7 @@
       clearTimeout(state.blockedShortsTimer);
       clearTimeout(state.shortsVolumeHideTimer);
       clearTimeout(state.customControlsHideTimer);
+      clearTimeout(state.shortsSafeVolumeTimer);
 
       state.bindTimer = 0;
       state.refreshTimer = 0;
@@ -832,11 +839,176 @@
         state.boundVideo = null;
       }
 
+      if (shouldRunShortsSafeVolumeSync()) {
+        scheduleShortsSafeVolume(`${reason}-volume`, 0);
+      }
+
       log('Shorts safe-mode active:', reason);
     } catch (error) {
       log('Shorts safe-mode cleanup failed:', error);
     }
   }
+
+
+
+  function shouldRunShortsSafeVolumeSync() {
+    return Boolean(
+      CONFIG.shortsSafeModeEnabled &&
+      CONFIG.shortsSafeVolumeSyncEnabled &&
+      (isShortsPage() || isSourceShortsPage())
+    );
+  }
+
+  function applyStoredVolumeToShortsVideo(video, reason = 'shorts-safe-volume') {
+    if (!shouldRunShortsSafeVolumeSync()) return false;
+    if (!video || String(video.tagName || '').toLowerCase() !== 'video') return false;
+
+    const stored = readStoredVolumePercent();
+    if (stored === null) return false;
+
+    try {
+      const beforeSlider = getVideoVolumePercent(video);
+      const beforeActual = getVideoActualVolumePercent(video);
+
+      const changed = setSingleVideoVolume(video, stored);
+
+      state.lastShortsSafeVolumeResult = {
+        reason,
+        storedSlider: stored,
+        mappedActual: sliderPercentToActualVolumePercent(stored),
+        beforeSlider,
+        beforeActual,
+        afterSlider: getVideoVolumePercent(video),
+        afterActual: getVideoActualVolumePercent(video),
+        changed,
+        at: new Date().toISOString(),
+      };
+
+      return changed;
+    } catch (error) {
+      state.lastShortsSafeVolumeResult = {
+        reason,
+        error: String(error && error.message ? error.message : error),
+        at: new Date().toISOString(),
+      };
+      return false;
+    }
+  }
+
+  function findActiveShortsVideoLightweight() {
+    if (!shouldRunShortsSafeVolumeSync()) return null;
+
+    try {
+      const videos = Array.from(document.querySelectorAll('video')).filter(Boolean);
+      if (!videos.length) return null;
+      if (videos.length === 1) return videos[0];
+
+      const playing = videos.find((video) => {
+        try {
+          return !video.paused && !video.ended && video.readyState >= 2;
+        } catch {
+          return false;
+        }
+      });
+
+      if (playing) return playing;
+
+      let best = null;
+      let bestArea = -1;
+
+      for (const video of videos.slice(0, 12)) {
+        try {
+          const rect = video.getBoundingClientRect();
+          const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+
+          if (area > bestArea && rect.bottom > 0 && rect.right > 0) {
+            best = video;
+            bestArea = area;
+          }
+        } catch {}
+      }
+
+      return best || videos[0];
+    } catch {
+      return null;
+    }
+  }
+
+  function syncShortsSafeVolume(reason = 'shorts-safe-volume') {
+    if (!shouldRunShortsSafeVolumeSync()) return false;
+
+    const video = findActiveShortsVideoLightweight();
+
+    if (!video) {
+      state.lastShortsSafeVolumeResult = {
+        reason,
+        foundVideo: false,
+        at: new Date().toISOString(),
+      };
+      return false;
+    }
+
+    return applyStoredVolumeToShortsVideo(video, reason);
+  }
+
+  function scheduleShortsSafeVolume(reason = 'shorts-safe-volume', delay = CONFIG.shortsSafeVolumeSyncDelayMs) {
+    if (!shouldRunShortsSafeVolumeSync()) return;
+
+    clearTimeout(state.shortsSafeVolumeTimer);
+    state.shortsSafeVolumeTimer = setTimeout(() => {
+      syncShortsSafeVolume(reason);
+    }, delay);
+  }
+
+  function bindShortsSafeVolumeSync() {
+    const onMediaEvent = (event) => {
+      if (!shouldRunShortsSafeVolumeSync()) return;
+
+      const video = event.target;
+      if (!video || String(video.tagName || '').toLowerCase() !== 'video') return;
+
+      if (event.type === 'play' || event.type === 'loadedmetadata') {
+        applyStoredVolumeToShortsVideo(video, `shorts-${event.type}`);
+        return;
+      }
+
+      if (event.type === 'volumechange') {
+        // Наше изменение само вызывает volumechange — его не ловим по кругу.
+        if (Date.now() <= state.volumeInternalChangeUntilMs) return;
+
+        const stored = readStoredVolumePercent();
+        if (stored === null) return;
+
+        const current = getVideoVolumePercent(video);
+
+        if (Math.abs(current - stored) >= 1 || (stored > 0 && video.muted)) {
+          setTimeout(() => {
+            applyStoredVolumeToShortsVideo(video, 'shorts-volume-reset');
+          }, 0);
+        }
+      }
+    };
+
+    document.addEventListener('play', onMediaEvent, true);
+    document.addEventListener('loadedmetadata', onMediaEvent, true);
+    document.addEventListener('volumechange', onMediaEvent, true);
+  }
+
+  window.cuShortsVolumeInfo = function cuShortsVolumeInfo() {
+    const stored = readStoredVolumePercent();
+
+    return {
+      enabled: CONFIG.shortsSafeVolumeSyncEnabled,
+      active: shouldRunShortsSafeVolumeSync(),
+      storedSlider: stored,
+      mappedActual: stored === null ? null : sliderPercentToActualVolumePercent(stored),
+      lastResult: state.lastShortsSafeVolumeResult,
+    };
+  };
+
+  window.cuSyncShortsVolume = function cuSyncShortsVolume() {
+    return syncShortsSafeVolume('manual-console');
+  };
 
 
   function shouldRunHeavyPlayerTasks() {
@@ -6788,6 +6960,8 @@ html.${APP_ID}-fs-active body {
       shouldRunHeavyPlayerTasks: shouldRunHeavyPlayerTasks(),
       shouldRunShortsTasks: shouldRunShortsTasks(),
       shouldRunVolumeSyncTasks: shouldRunVolumeSyncTasks(),
+      shortsSafeVolumeSyncActive: shouldRunShortsSafeVolumeSync(),
+      lastShortsSafeVolumeResult: state.lastShortsSafeVolumeResult,
       observerInstalled: Boolean(state.observer),
       boundVideo: Boolean(state.boundVideo),
     };
@@ -7107,6 +7281,7 @@ html.${APP_ID}-fs-active body {
 
     if (isShortsSafeModePage()) {
       stopShortsRuntimeTasks(reason);
+      scheduleShortsSafeVolume(`${reason}-route`, 0);
       return;
     }
 
@@ -7275,7 +7450,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.19',
+      version: '0.3.20',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -7331,6 +7506,9 @@ html.${APP_ID}-fs-active body {
       shortsCssCleanupEnabled: CONFIG.shortsCssCleanupEnabled,
       shortsSafeModeEnabled: CONFIG.shortsSafeModeEnabled,
       shortsSafeModePage: isShortsSafeModePage(),
+      shortsSafeVolumeSyncEnabled: CONFIG.shortsSafeVolumeSyncEnabled,
+      shortsSafeVolumeSyncActive: shouldRunShortsSafeVolumeSync(),
+      lastShortsSafeVolumeResult: state.lastShortsSafeVolumeResult,
       shortsRouteClass: document.documentElement?.classList.contains(`${APP_ID}-page-shorts`) ? 'shorts' : 'nonshorts',
       shortsTransitioning: Boolean(document.documentElement?.classList.contains(`${APP_ID}-shorts-transitioning`)),
       homePoopNegativeFeedback: CONFIG.homePoopNegativeFeedback,
@@ -7420,9 +7598,11 @@ html.${APP_ID}-fs-active body {
     syncNativeAdPoll('init');
     ensureHomeCleanupStyle();
     bindHomePreviewStopper();
+    bindShortsSafeVolumeSync();
 
     if (isShortsSafeModePage()) {
       stopShortsRuntimeTasks('init');
+      scheduleShortsSafeVolume('init-shorts', 0);
     } else {
       scheduleBind();
     }
@@ -7464,6 +7644,7 @@ html.${APP_ID}-fs-active body {
       if (!document.hidden) {
         if (isShortsSafeModePage()) {
           stopShortsRuntimeTasks('visibility');
+          scheduleShortsSafeVolume('visibility-shorts', 0);
           return;
         }
 
