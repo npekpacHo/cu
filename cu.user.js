@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Cleaner mobile YouTube: ads, SponsorBlock, synced volume, fullscreen and Shorts blacklist.
-// @description:ru Чище мобильный YouTube: реклама, SponsorBlock, единая громкость, fullscreen и ЧС Shorts.
+// @description  Cleaner mobile YouTube: reliable SponsorBlock, ads, synced volume and fullscreen.
+// @description:ru Чище мобильный YouTube: SponsorBlock, реклама, единая громкость и fullscreen.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.20
+// @version      0.3.22
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -50,8 +50,28 @@
       Это чуть приватнее, чем прямой запрос по videoID.
       Если crypto.subtle недоступен, скрипт сам откатится к обычному запросу.
     */
-    useHashPrefixApi: true,
+    useHashPrefixApi: false,
     hashPrefixLength: 4,
+
+    /*
+      0.3.21: hash-prefix остаётся первым (приватнее), но любая ошибка/неполный
+      ответ теперь гарантированно откатывается к прямому API по videoID.
+    */
+    sponsorBlockDirectFallback: true,
+
+    /*
+      0.3.22:
+      надёжность важнее приватности hash-prefix. Сначала прямой API по videoID.
+      Пропуск больше не считается успешным только потому, что присваивание
+      currentTime не бросило исключение.
+    */
+    sponsorPreferDirectApi: true,
+    sponsorWakeMaxDelayMs: 8000,
+    sponsorPrecisionLeadMs: 220,
+    sponsorPrecisionPollMs: 35,
+    sponsorSeekVerifyDelayMs: 140,
+    sponsorSeekToleranceSec: 1.2,
+    sponsorSeekRetryDelayMs: 120,
 
     cacheTtlMs: 6 * 60 * 60 * 1000,
 
@@ -440,6 +460,14 @@
     boundVideo: null,
     bindTimer: 0,
     refreshTimer: 0,
+    sponsorWakeTimer: 0,
+    sponsorPrecisionTimer: 0,
+    sponsorPrecisionInterval: 0,
+    sponsorActiveVideo: null,
+    sponsorSeekToken: 0,
+    sponsorSeekInFlight: false,
+    sponsorTrace: [],
+    lastSponsorVerifiedSeek: null,
 
     nativeAdPollTimer: 0,
     nativeAdWasActive: false,
@@ -451,6 +479,7 @@
     lastSkipAtMs: 0,
     lastSponsorBlockFetch: null,
     lastSponsorBlockError: null,
+    lastSponsorSkipResult: null,
 
     fsHintEl: null,
     customControlsEl: null,
@@ -796,6 +825,7 @@
     try {
       clearTimeout(state.bindTimer);
       clearTimeout(state.refreshTimer);
+      clearSponsorWakeTimer();
       clearTimeout(state.volumeSyncTimer);
       clearTimeout(state.channelFilterTimer);
       clearTimeout(state.homePoopTimer);
@@ -827,8 +857,10 @@
       */
       if (state.boundVideo) {
         try {
-          state.boundVideo.removeEventListener('timeupdate', runSkipCheck);
-          state.boundVideo.removeEventListener('seeking', runSkipCheck);
+          state.boundVideo.removeEventListener('timeupdate', onSponsorTimeUpdate);
+          state.boundVideo.removeEventListener('seeking', onSponsorSeeking);
+          state.boundVideo.removeEventListener('seeked', onSponsorSeeked);
+          state.boundVideo.removeEventListener('ratechange', onSponsorRateChange);
           state.boundVideo.removeEventListener('loadedmetadata', onVideoMetadata);
           state.boundVideo.removeEventListener('play', onVideoPlay);
           state.boundVideo.removeEventListener('pause', updateCustomControls);
@@ -1425,7 +1457,7 @@
 
   function gmRequestJson(url) {
     return new Promise((resolve, reject) => {
-      const parse = (status, text) => {
+      const parsePayload = (status, payload) => {
         if (status === 404) {
           resolve(null);
           return;
@@ -1437,24 +1469,46 @@
         }
 
         try {
-          resolve(JSON.parse(text || 'null'));
+          if (payload === null || payload === undefined || payload === '') {
+            resolve(null);
+            return;
+          }
+
+          if (typeof payload === 'object') {
+            resolve(payload);
+            return;
+          }
+
+          resolve(JSON.parse(String(payload)));
         } catch (error) {
-          reject(error);
+          reject(new Error(`JSON parse failed: ${error?.message || error}`));
         }
       };
 
       if (typeof GM_xmlhttpRequest === 'function') {
-        GM_xmlhttpRequest({
-          method: 'GET',
-          url,
-          headers: { Accept: 'application/json' },
-          timeout: 12000,
-          onload: (res) => parse(res.status, res.responseText || ''),
-          onerror: () => reject(new Error('GM_xmlhttpRequest error')),
-          ontimeout: () => reject(new Error('GM_xmlhttpRequest timeout')),
-        });
+        try {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            headers: { Accept: 'application/json' },
+            responseType: 'text',
+            timeout: 12000,
+            onload: (res) => {
+              const payload =
+                typeof res?.responseText === 'string' && res.responseText.length
+                  ? res.responseText
+                  : res?.response;
 
-        return;
+              parsePayload(Number(res?.status || 0), payload);
+            },
+            onerror: (res) => reject(new Error(`GM_xmlhttpRequest error${res?.status ? ` HTTP ${res.status}` : ''}`)),
+            ontimeout: () => reject(new Error('GM_xmlhttpRequest timeout')),
+            onabort: () => reject(new Error('GM_xmlhttpRequest aborted')),
+          });
+          return;
+        } catch (error) {
+          log('GM_xmlhttpRequest setup failed, trying fetch:', error);
+        }
       }
 
       fetch(url, {
@@ -1565,23 +1619,104 @@
 
     const prefix = hash.slice(0, CONFIG.hashPrefixLength);
     const url = `${SB_API}/api/skipSegments/${encodeURIComponent(prefix)}?${sponsorBlockQueryParams()}`;
-
     const data = await gmRequestJson(url);
-    if (!Array.isArray(data)) return [];
+
+    // 404/пустой ответ => не считаем это доказательством отсутствия сегментов.
+    // Дадим прямому endpoint вторую попытку.
+    if (data === null) return null;
+    if (!Array.isArray(data)) throw new Error('SponsorBlock hash response is not an array');
 
     const exact = data.find((item) => item && item.videoID === videoId);
-    return exact && Array.isArray(exact.segments) ? exact.segments : [];
+    if (!exact) return null;
+    if (!Array.isArray(exact.segments)) throw new Error('SponsorBlock hash item has no segments array');
+
+    return exact.segments;
   }
 
   async function fetchSegmentsDirect(videoId) {
     const params = new URLSearchParams(sponsorBlockQueryParams());
+    params.delete('trimUUIDs');
     params.set('videoID', videoId);
 
     const url = `${SB_API}/api/skipSegments?${params.toString()}`;
     const data = await gmRequestJson(url);
 
-    return Array.isArray(data) ? data : [];
+    if (data === null) return [];
+    if (!Array.isArray(data)) throw new Error('SponsorBlock direct response is not an array');
+
+    return data;
   }
+
+
+  function sponsorTrace(stage, data = {}) {
+    try {
+      const item = {
+        at: new Date().toISOString(),
+        stage,
+        ...data,
+      };
+
+      state.sponsorTrace.push(item);
+      if (state.sponsorTrace.length > 80) {
+        state.sponsorTrace.splice(0, state.sponsorTrace.length - 80);
+      }
+
+      log('SponsorBlock trace', item);
+      return item;
+    } catch {
+      return null;
+    }
+  }
+
+  function isSponsorNativeAdActive() {
+    try {
+      const signals = getNativeAdSignals();
+      return Boolean(signals?.active || signals?.playerAdShowing || signals?.playerAdInterrupting);
+    } catch {
+      return false;
+    }
+  }
+
+  function isUsableSponsorVideo(video) {
+    try {
+      if (!video || String(video.tagName || '').toLowerCase() !== 'video') return false;
+      if (!video.isConnected) return false;
+      if (!Number.isFinite(video.currentTime)) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function adoptSponsorVideo(video, reason = 'media-event') {
+    if (!isUsableSponsorVideo(video)) return false;
+    if (isShortsSafeModePage() || isHomeSafeModePage()) return false;
+
+    if (state.sponsorActiveVideo !== video) {
+      state.sponsorActiveVideo = video;
+      sponsorTrace('video-adopted', {
+        reason,
+        currentTime: Number(video.currentTime || 0),
+        paused: Boolean(video.paused),
+        readyState: Number(video.readyState || 0),
+        className: String(video.className || ''),
+      });
+    }
+
+    return true;
+  }
+
+  function clearSponsorPrecisionTimers() {
+    clearTimeout(state.sponsorPrecisionTimer);
+    clearInterval(state.sponsorPrecisionInterval);
+    state.sponsorPrecisionTimer = 0;
+    state.sponsorPrecisionInterval = 0;
+  }
+
+  window.cuSponsorTrace = function cuSponsorTrace() {
+    return [...state.sponsorTrace];
+  };
+
 
   async function getSponsorSegments(videoId, options = {}) {
     const bypassCache = Boolean(options.bypassCache);
@@ -1589,7 +1724,6 @@
 
     if (!bypassCache) {
       const cached = readCache(videoId);
-
       if (cached !== null) {
         state.lastSponsorBlockFetch = {
           videoId,
@@ -1599,75 +1733,301 @@
           count: cached.length,
           at: new Date().toISOString(),
         };
-
         return cached;
       }
     }
 
+    const errors = [];
     let raw = null;
     let source = '';
-    let requestError = null;
 
-    try {
-      if (forceDirect) {
-        raw = await fetchSegmentsDirect(videoId);
-        source = 'direct';
-      } else if (CONFIG.useHashPrefixApi) {
-        raw = await fetchSegmentsByHashPrefix(videoId);
+    const tryDirect = async () => {
+      try {
+        const value = await fetchSegmentsDirect(videoId);
+        return { ok: true, value };
+      } catch (error) {
+        errors.push({ source: 'direct', message: String(error?.message || error) });
+        return { ok: false, value: null };
+      }
+    };
+
+    const tryHash = async () => {
+      try {
+        const value = await fetchSegmentsByHashPrefix(videoId);
+        return { ok: value !== null, value };
+      } catch (error) {
+        errors.push({ source: 'hash-prefix', message: String(error?.message || error) });
+        return { ok: false, value: null };
+      }
+    };
+
+    if (forceDirect || CONFIG.sponsorPreferDirectApi || !CONFIG.useHashPrefixApi) {
+      const direct = await tryDirect();
+      if (direct.ok) {
+        raw = direct.value;
+        source = forceDirect ? 'direct-force' : 'direct';
+      } else if (!forceDirect && CONFIG.useHashPrefixApi) {
+        const hashed = await tryHash();
+        if (hashed.ok) {
+          raw = hashed.value;
+          source = 'hash-fallback';
+        }
+      }
+    } else {
+      const hashed = await tryHash();
+      if (hashed.ok) {
+        raw = hashed.value;
         source = 'hash-prefix';
+      } else if (CONFIG.sponsorBlockDirectFallback) {
+        const direct = await tryDirect();
+        if (direct.ok) {
+          raw = direct.value;
+          source = 'direct-fallback';
+        }
       }
-
-      if (raw === null) {
-        raw = await fetchSegmentsDirect(videoId);
-        source = 'direct';
-      }
-    } catch (error) {
-      requestError = error;
-      state.lastSponsorBlockError = {
-        videoId,
-        message: String(error && error.message ? error.message : error),
-        source: source || (forceDirect ? 'direct' : 'request'),
-        at: new Date().toISOString(),
-      };
-      log('SponsorBlock request failed:', error);
     }
 
-    if (requestError) {
-      /*
-        Критично: не кешируем ошибку как "сегментов нет".
-        Иначе один сетевой чих превращается в шесть часов саморекламы.
-      */
+    if (raw === null) {
+      state.lastSponsorBlockError = {
+        videoId,
+        errors,
+        message: errors.map((item) => `${item.source}: ${item.message}`).join('; ') || 'no usable response',
+        at: new Date().toISOString(),
+      };
       state.lastSponsorBlockFetch = {
         videoId,
-        source: source || 'error',
+        source: 'error',
         categories: [...CONFIG.categories],
         segments: [],
         count: 0,
         error: state.lastSponsorBlockError,
         at: new Date().toISOString(),
       };
-
       return [];
     }
 
     const segments = normalizeSegments(raw);
     writeCache(videoId, segments);
 
-    state.lastSponsorBlockError = null;
+    sponsorTrace('segments-fetched', {
+      videoId,
+      source,
+      rawCount: Array.isArray(raw) ? raw.length : null,
+      normalizedCount: segments.length,
+      categories: [...CONFIG.categories],
+    });
+
+    state.lastSponsorBlockError = errors.length ? { videoId, errors, recovered: true, at: new Date().toISOString() } : null;
     state.lastSponsorBlockFetch = {
       videoId,
-      source: source || 'unknown',
+      source,
       categories: [...CONFIG.categories],
       segments,
       count: segments.length,
+      fallbackErrors: errors,
       at: new Date().toISOString(),
     };
 
     return segments;
   }
 
+  function getSponsorVideoId() {
+    const fromUrl = getVideoIdFromUrl();
+    if (fromUrl) return fromUrl;
+
+    const fromPlayer = getVideoIdFromPlayerResponse();
+    if (fromPlayer) return fromPlayer;
+
+    try {
+      const canonical = document.querySelector('link[rel="canonical"]')?.href || '';
+      const fromCanonical = canonical ? getVideoIdFromUrl(canonical) : '';
+      if (fromCanonical) return fromCanonical;
+    } catch {}
+
+    return '';
+  }
+
+  function resolveSponsorVideo(source = null) {
+    try {
+      const direct = source && String(source.tagName || '').toLowerCase() === 'video' ? source : null;
+      if (isUsableSponsorVideo(direct)) return direct;
+
+      const currentTarget = source?.currentTarget;
+      if (isUsableSponsorVideo(currentTarget)) return currentTarget;
+
+      const target = source?.target;
+      if (isUsableSponsorVideo(target)) return target;
+
+      if (isUsableSponsorVideo(state.sponsorActiveVideo)) return state.sponsorActiveVideo;
+      if (isUsableSponsorVideo(state.boundVideo)) return state.boundVideo;
+
+      const player = getPlayer();
+      const main = player?.querySelector?.('video.html5-main-video, video');
+      if (isUsableSponsorVideo(main)) return main;
+
+      const fallback = document.querySelector('video.html5-main-video') || getVideo();
+      return isUsableSponsorVideo(fallback) ? fallback : null;
+    } catch {
+      return isUsableSponsorVideo(state.sponsorActiveVideo)
+        ? state.sponsorActiveVideo
+        : (isUsableSponsorVideo(state.boundVideo) ? state.boundVideo : null);
+    }
+  }
+
+  function clearSponsorWakeTimer() {
+    clearTimeout(state.sponsorWakeTimer);
+    state.sponsorWakeTimer = 0;
+    clearSponsorPrecisionTimers();
+  }
+
+  function getSponsorSegmentState(video) {
+    if (!video || !state.segments.length || !Number.isFinite(video.currentTime)) {
+      return { current: null, segment: null, next: null };
+    }
+
+    const current = Number(video.currentTime);
+
+    const segment = state.segments.find(
+      (item) =>
+        current >= item.start - CONFIG.skipBeforeStartSec &&
+        current < item.end - CONFIG.skipAfterEndSec,
+    ) || null;
+
+    const next = state.segments.find(
+      (item) => item.start - CONFIG.skipBeforeStartSec > current,
+    ) || null;
+
+    return { current, segment, next };
+  }
+
+  function startSponsorPrecisionWindow(video, segment, reason = 'precision') {
+    clearInterval(state.sponsorPrecisionInterval);
+
+    if (!isUsableSponsorVideo(video) || !segment) return;
+
+    sponsorTrace('precision-window', {
+      reason,
+      currentTime: Number(video.currentTime || 0),
+      segmentStart: segment.start,
+      segmentEnd: segment.end,
+    });
+
+    const startedAt = performance.now();
+
+    state.sponsorPrecisionInterval = setInterval(() => {
+      if (!isUsableSponsorVideo(video) || video.paused || isSponsorNativeAdActive()) {
+        clearInterval(state.sponsorPrecisionInterval);
+        state.sponsorPrecisionInterval = 0;
+        scheduleSponsorWake('precision-paused', video);
+        return;
+      }
+
+      const current = Number(video.currentTime);
+
+      if (
+        current >= segment.start - CONFIG.skipBeforeStartSec &&
+        current < segment.end - CONFIG.skipAfterEndSec
+      ) {
+        clearInterval(state.sponsorPrecisionInterval);
+        state.sponsorPrecisionInterval = 0;
+        runSkipCheck(video);
+        return;
+      }
+
+      if (current >= segment.end || performance.now() - startedAt > 2500) {
+        clearInterval(state.sponsorPrecisionInterval);
+        state.sponsorPrecisionInterval = 0;
+        scheduleSponsorWake('precision-expired', video);
+      }
+    }, CONFIG.sponsorPrecisionPollMs);
+  }
+
+  function scheduleSponsorWake(reason = 'wake', source = null) {
+    clearSponsorWakeTimer();
+
+    if (!shouldRunHeavyPlayerTasks() || !state.segments.length) return;
+
+    const video = resolveSponsorVideo(source);
+    if (!video || video.paused || !Number.isFinite(video.currentTime)) return;
+
+    adoptSponsorVideo(video, `wake-${reason}`);
+
+    if (isSponsorNativeAdActive()) {
+      sponsorTrace('schedule-paused-for-native-ad', { reason });
+      state.sponsorWakeTimer = setTimeout(() => {
+        scheduleSponsorWake('native-ad-recheck', video);
+      }, 500);
+      return;
+    }
+
+    const { current, segment, next } = getSponsorSegmentState(video);
+
+    if (segment) {
+      state.sponsorWakeTimer = setTimeout(() => runSkipCheck(video), 0);
+      return;
+    }
+
+    if (!next) return;
+
+    const rate = Number.isFinite(video.playbackRate) && video.playbackRate > 0 ? video.playbackRate : 1;
+    const secondsUntil = Math.max(0, next.start - CONFIG.skipBeforeStartSec - current);
+    const rawDelay = (secondsUntil * 1000) / rate;
+    const lead = CONFIG.sponsorPrecisionLeadMs;
+
+    if (rawDelay <= lead + 80) {
+      startSponsorPrecisionWindow(video, next, reason);
+      return;
+    }
+
+    const delay = Math.max(
+      40,
+      Math.min(CONFIG.sponsorWakeMaxDelayMs, rawDelay - lead),
+    );
+
+    state.sponsorWakeTimer = setTimeout(() => {
+      const fresh = getSponsorSegmentState(video);
+
+      if (fresh.segment) {
+        runSkipCheck(video);
+      } else if (fresh.next) {
+        const freshRate = Number.isFinite(video.playbackRate) && video.playbackRate > 0 ? video.playbackRate : 1;
+        const freshDelay = ((fresh.next.start - CONFIG.skipBeforeStartSec - fresh.current) * 1000) / freshRate;
+
+        if (freshDelay <= CONFIG.sponsorPrecisionLeadMs + 100) {
+          startSponsorPrecisionWindow(video, fresh.next, 'wake-near-segment');
+        } else {
+          scheduleSponsorWake('wake-recheck', video);
+        }
+      }
+    }, delay);
+
+    sponsorTrace('wake-scheduled', {
+      reason,
+      delay,
+      current,
+      nextStart: next.start,
+      nextEnd: next.end,
+    });
+  }
+
+  function sponsorVideoSummary(video) {
+    if (!video) return null;
+    try {
+      return {
+        connected: Boolean(video.isConnected),
+        currentTime: Number.isFinite(video.currentTime) ? Number(video.currentTime.toFixed(3)) : null,
+        duration: Number.isFinite(video.duration) ? Number(video.duration.toFixed(3)) : null,
+        paused: Boolean(video.paused),
+        readyState: Number(video.readyState || 0),
+        className: String(video.className || ''),
+      };
+    } catch {
+      return { connected: Boolean(video?.isConnected) };
+    }
+  }
+
   async function refreshSegments(reason = 'refresh', force = false) {
-    const videoId = getVideoIdFromUrl();
+    const videoId = getSponsorVideoId();
 
     if (!videoId) {
       state.videoId = '';
@@ -1675,10 +2035,14 @@
       state.segments = [];
       state.lastSkipKey = '';
       state.lastSkipAtMs = 0;
+      clearSponsorWakeTimer();
       return;
     }
 
-    if (!force && videoId === state.loadedVideoId) return;
+    if (!force && videoId === state.loadedVideoId) {
+      scheduleSponsorWake(`${reason}-already-loaded`, state.boundVideo);
+      return;
+    }
 
     const token = ++state.loadToken;
 
@@ -1687,8 +2051,10 @@
     state.segments = [];
     state.lastSkipKey = '';
     state.lastSkipAtMs = 0;
+    clearSponsorWakeTimer();
 
     log('loading SponsorBlock segments', { videoId, reason });
+    sponsorTrace('segments-load-start', { videoId, reason });
 
     const segments = await getSponsorSegments(videoId, {
       bypassCache: force,
@@ -1696,7 +2062,7 @@
     });
 
     if (token !== state.loadToken) return;
-    if (videoId !== getVideoIdFromUrl()) return;
+    if (videoId !== getSponsorVideoId()) return;
 
     state.loadedVideoId = videoId;
     state.segments = segments;
@@ -1705,12 +2071,13 @@
       toast(`${APP_SHORT}: найдено сегментов: ${segments.length}`, 1200);
     }
 
-    runSkipCheck();
+    runSkipCheck(state.boundVideo);
+    scheduleSponsorWake('segments-loaded', state.boundVideo);
   }
 
 
   function getSponsorBlockInfo() {
-    const videoId = getVideoIdFromUrl();
+    const videoId = getSponsorVideoId();
     const byCategory = {};
 
     for (const segment of state.segments) {
@@ -1737,7 +2104,7 @@
   };
 
   window.cuRefreshSponsorBlock = async function cuRefreshSponsorBlock() {
-    const videoId = getVideoIdFromUrl();
+    const videoId = getSponsorVideoId();
     if (!videoId) return { ok: false, reason: 'no-video-id' };
 
     try {
@@ -1754,7 +2121,7 @@
   };
 
   window.cuProbeSponsorBlock = async function cuProbeSponsorBlock() {
-    const videoId = getVideoIdFromUrl();
+    const videoId = getSponsorVideoId();
     if (!videoId) return { ok: false, reason: 'no-video-id' };
 
     try {
@@ -1784,6 +2151,88 @@
   };
 
 
+  window.cuSponsorSelfTest = function cuSponsorSelfTest() {
+    const video = resolveSponsorVideo(state.boundVideo);
+    const current = Number.isFinite(video?.currentTime) ? video.currentTime : null;
+    const nextSegment = current === null
+      ? null
+      : state.segments.find((segment) => segment.end > current) || null;
+
+    return {
+      urlVideoId: getVideoIdFromUrl(),
+      playerVideoId: getVideoIdFromPlayerResponse(),
+      resolvedVideoId: getSponsorVideoId(),
+      loadedVideoId: state.loadedVideoId,
+      segmentsLoaded: state.segments.length,
+      boundVideoConnected: Boolean(state.boundVideo?.isConnected),
+      sponsorVideoIsBound: Boolean(video && video === state.boundVideo),
+      sponsorVideo: sponsorVideoSummary(video),
+      nextSegment,
+      lastFetch: state.lastSponsorBlockFetch,
+      lastError: state.lastSponsorBlockError,
+      lastSkip: state.lastSponsorSkipResult,
+      lastVerifiedSeek: state.lastSponsorVerifiedSeek,
+      sponsorActiveVideo: sponsorVideoSummary(state.sponsorActiveVideo),
+      seekInFlight: state.sponsorSeekInFlight,
+      wakeTimerActive: Boolean(state.sponsorWakeTimer),
+      precisionTimerActive: Boolean(state.sponsorPrecisionTimer || state.sponsorPrecisionInterval),
+      nativeAdActive: isSponsorNativeAdActive(),
+      traceTail: state.sponsorTrace.slice(-12),
+    };
+  };
+
+
+  window.cuSponsorDiagnostic = async function cuSponsorDiagnostic() {
+    const videoId = getSponsorVideoId();
+    const video = resolveSponsorVideo(state.sponsorActiveVideo || state.boundVideo);
+    let api = null;
+
+    try {
+      const raw = videoId ? await fetchSegmentsDirect(videoId) : null;
+      const segments = normalizeSegments(raw || []);
+      api = {
+        ok: true,
+        videoId,
+        rawCount: Array.isArray(raw) ? raw.length : null,
+        normalizedCount: segments.length,
+        segments,
+      };
+    } catch (error) {
+      api = {
+        ok: false,
+        videoId,
+        error: String(error?.message || error),
+      };
+    }
+
+    const player =
+      video?.closest?.('#movie_player, .html5-video-player') ||
+      document.querySelector('#movie_player, .html5-video-player');
+
+    return {
+      version: '0.3.22',
+      api,
+      loadedVideoId: state.loadedVideoId,
+      loadedSegments: state.segments,
+      video: sponsorVideoSummary(video),
+      capabilities: {
+        fastSeek: typeof video?.fastSeek === 'function',
+        prototypeCurrentTimeSetter: Boolean(
+          Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime')?.set
+        ),
+        playerSeekTo: typeof player?.seekTo === 'function',
+      },
+      nativeAdActive: isSponsorNativeAdActive(),
+      nextSegment: (() => {
+        if (!video || !Number.isFinite(video.currentTime)) return null;
+        return state.segments.find((segment) => segment.end > video.currentTime) || null;
+      })(),
+      lastVerifiedSeek: state.lastSponsorVerifiedSeek,
+      traceTail: state.sponsorTrace.slice(-20),
+    };
+  };
+
+
   function scheduleRefresh(reason = 'scheduled') {
     if (!shouldRunHeavyPlayerTasks()) return;
 
@@ -1791,13 +2240,160 @@
     state.refreshTimer = setTimeout(() => refreshSegments(reason), 250);
   }
 
-  function runSkipCheck() {
-    const video = getVideo();
 
-    if (!video || !state.segments.length) return;
-    if (!Number.isFinite(video.currentTime)) return;
+  function delayMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
 
-    const current = video.currentTime;
+  function sponsorSeekVerified(video, target) {
+    try {
+      if (!isUsableSponsorVideo(video)) return false;
+      const after = Number(video.currentTime);
+      return Number.isFinite(after) && (
+        after >= target - CONFIG.sponsorSeekToleranceSec ||
+        Math.abs(after - target) <= CONFIG.sponsorSeekToleranceSec
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  async function trySponsorSeekStrategy(video, target, strategy) {
+    const before = Number(video.currentTime);
+
+    try {
+      if (strategy === 'currentTime') {
+        video.currentTime = target;
+      } else if (strategy === 'prototype-setter') {
+        const descriptor =
+          Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime') ||
+          Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'currentTime');
+
+        if (typeof descriptor?.set !== 'function') {
+          return { ok: false, strategy, reason: 'no-prototype-setter', before };
+        }
+
+        descriptor.set.call(video, target);
+      } else if (strategy === 'fastSeek') {
+        if (typeof video.fastSeek !== 'function') {
+          return { ok: false, strategy, reason: 'no-fastSeek', before };
+        }
+
+        video.fastSeek(target);
+      } else if (strategy === 'player-seekTo') {
+        const player =
+          video.closest?.('#movie_player, .html5-video-player') ||
+          document.querySelector('#movie_player, .html5-video-player');
+
+        if (typeof player?.seekTo !== 'function') {
+          return { ok: false, strategy, reason: 'no-player-seekTo', before };
+        }
+
+        player.seekTo(target, true);
+      } else {
+        return { ok: false, strategy, reason: 'unknown-strategy', before };
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        strategy,
+        before,
+        error: String(error?.message || error),
+      };
+    }
+
+    await delayMs(CONFIG.sponsorSeekVerifyDelayMs);
+
+    const after = Number(video.currentTime);
+    const ok = sponsorSeekVerified(video, target);
+
+    return { ok, strategy, before, after };
+  }
+
+  async function seekSponsorVideoVerified(video, target, segment) {
+    if (!isUsableSponsorVideo(video)) {
+      return { ok: false, reason: 'invalid-video' };
+    }
+
+    if (state.sponsorSeekInFlight) {
+      return { ok: false, reason: 'seek-in-flight' };
+    }
+
+    const token = ++state.sponsorSeekToken;
+    state.sponsorSeekInFlight = true;
+
+    const attempts = [];
+    const strategies = ['currentTime', 'prototype-setter', 'fastSeek', 'player-seekTo'];
+
+    sponsorTrace('seek-start', {
+      target,
+      currentTime: Number(video.currentTime),
+      category: segment?.category || '',
+    });
+
+    try {
+      for (const strategy of strategies) {
+        if (token !== state.sponsorSeekToken) {
+          return { ok: false, reason: 'superseded', attempts };
+        }
+
+        const result = await trySponsorSeekStrategy(video, target, strategy);
+        attempts.push(result);
+
+        sponsorTrace('seek-attempt', {
+          target,
+          category: segment?.category || '',
+          ...result,
+        });
+
+        if (result.ok) {
+          const verified = {
+            ok: true,
+            strategy,
+            target,
+            after: Number(video.currentTime),
+            attempts,
+            at: new Date().toISOString(),
+          };
+
+          state.lastSponsorVerifiedSeek = verified;
+          return verified;
+        }
+
+        await delayMs(CONFIG.sponsorSeekRetryDelayMs);
+      }
+
+      const failed = {
+        ok: false,
+        target,
+        after: Number(video.currentTime),
+        attempts,
+        at: new Date().toISOString(),
+      };
+
+      state.lastSponsorVerifiedSeek = failed;
+      return failed;
+    } finally {
+      if (token === state.sponsorSeekToken) {
+        state.sponsorSeekInFlight = false;
+      }
+    }
+  }
+
+
+  function runSkipCheck(source = null) {
+    const video = resolveSponsorVideo(source);
+
+    if (!video || !state.segments.length) return false;
+    if (!Number.isFinite(video.currentTime)) return false;
+    if (isSponsorNativeAdActive()) {
+      scheduleSponsorWake('skip-blocked-native-ad', video);
+      return false;
+    }
+
+    adoptSponsorVideo(video, 'skip-check');
+
+    const current = Number(video.currentTime);
     const now = Date.now();
 
     for (const segment of state.segments) {
@@ -1807,35 +2403,134 @@
       if (current >= start - CONFIG.skipBeforeStartSec && current < end - CONFIG.skipAfterEndSec) {
         const key = `${segment.category}:${start.toFixed(2)}-${end.toFixed(2)}`;
 
-        if (state.lastSkipKey === key && now - state.lastSkipAtMs < 1500) return;
+        if (state.sponsorSeekInFlight) return false;
+        if (state.lastSkipKey === key && now - state.lastSkipAtMs < 500) return false;
 
         const duration = Number.isFinite(video.duration) ? video.duration : end + CONFIG.skipAfterEndSec;
         const target = Math.min(end + CONFIG.skipAfterEndSec, duration);
 
-        try {
-          state.lastSkipKey = key;
-          state.lastSkipAtMs = now;
-          video.currentTime = target;
+        state.lastSkipKey = key;
+        state.lastSkipAtMs = now;
 
-          toast(`${APP_SHORT}: пропущено, ${categoryLabel(segment.category)}`);
-          log('skipped segment', { key, from: current, to: target });
-        } catch (error) {
-          log('skip failed:', error);
-        }
+        sponsorTrace('segment-hit', {
+          videoId: state.loadedVideoId || getSponsorVideoId(),
+          category: segment.category,
+          current,
+          start,
+          end,
+          target,
+        });
 
-        return;
+        seekSponsorVideoVerified(video, target, segment).then((result) => {
+          const after = Number.isFinite(video.currentTime) ? Number(video.currentTime) : null;
+
+          state.lastSponsorSkipResult = {
+            ok: Boolean(result.ok),
+            verified: true,
+            videoId: state.loadedVideoId || getSponsorVideoId(),
+            category: segment.category,
+            key,
+            from: current,
+            to: target,
+            after,
+            strategy: result.strategy || null,
+            attempts: result.attempts || [],
+            video: sponsorVideoSummary(video),
+            at: new Date().toISOString(),
+          };
+
+          if (result.ok) {
+            toast(`${APP_SHORT}: пропущено, ${categoryLabel(segment.category)}`);
+            sponsorTrace('skip-verified', state.lastSponsorSkipResult);
+            scheduleSponsorWake('after-verified-skip', video);
+          } else {
+            /*
+              Не блокируем повтор навсегда: YouTube мог откатить seek во время
+              переключения player state. Через небольшой интервал попробуем снова.
+            */
+            state.lastSkipKey = '';
+            state.lastSkipAtMs = 0;
+            sponsorTrace('skip-failed-verification', state.lastSponsorSkipResult);
+
+            setTimeout(() => {
+              if (isUsableSponsorVideo(video)) {
+                runSkipCheck(video);
+                scheduleSponsorWake('retry-after-failed-seek', video);
+              }
+            }, 250);
+          }
+        });
+
+        return true;
       }
+    }
+
+    return false;
+  }
+
+  function onSponsorTimeUpdate(event) {
+    const video = event?.currentTarget || event?.target;
+    adoptSponsorVideo(video, 'timeupdate');
+    runSkipCheck(video);
+  }
+
+  function onSponsorSeeking(event) {
+    const video = event?.currentTarget || event?.target;
+    adoptSponsorVideo(video, 'seeking');
+    clearSponsorPrecisionTimers();
+  }
+
+  function onSponsorSeeked(event) {
+    const video = event?.currentTarget || event?.target;
+    adoptSponsorVideo(video, 'seeked');
+    runSkipCheck(video);
+    scheduleSponsorWake('seeked', video);
+  }
+
+  function onSponsorRateChange(event) {
+    const video = event?.currentTarget || event?.target;
+    adoptSponsorVideo(video, 'ratechange');
+    scheduleSponsorWake('ratechange', video);
+  }
+
+
+  function onGlobalSponsorMediaSignal(event) {
+    if (isShortsSafeModePage() || isHomeSafeModePage()) return;
+
+    const video = event?.target;
+    if (!isUsableSponsorVideo(video)) return;
+
+    if (!isWatchLikePage() && !getSponsorVideoId()) return;
+
+    adoptSponsorVideo(video, `global-${event.type}`);
+
+    if (event.type === 'play' || event.type === 'playing' || event.type === 'loadedmetadata') {
+      scheduleRefresh(`global-${event.type}`);
+      scheduleSponsorWake(`global-${event.type}`, video);
+    } else if (event.type === 'timeupdate') {
+      runSkipCheck(video);
     }
   }
 
+  function bindGlobalSponsorMediaSignals() {
+    document.addEventListener('play', onGlobalSponsorMediaSignal, true);
+    document.addEventListener('playing', onGlobalSponsorMediaSignal, true);
+    document.addEventListener('loadedmetadata', onGlobalSponsorMediaSignal, true);
+    document.addEventListener('timeupdate', onGlobalSponsorMediaSignal, true);
+  }
+
+
   function bindVideo() {
-    const video = getVideo();
+    const player = getPlayer();
+    const video = player?.querySelector?.('video.html5-main-video, video') || getVideo();
 
     if (!video || video === state.boundVideo) return;
 
     if (state.boundVideo) {
-      state.boundVideo.removeEventListener('timeupdate', runSkipCheck);
-      state.boundVideo.removeEventListener('seeking', runSkipCheck);
+      state.boundVideo.removeEventListener('timeupdate', onSponsorTimeUpdate);
+      state.boundVideo.removeEventListener('seeking', onSponsorSeeking);
+      state.boundVideo.removeEventListener('seeked', onSponsorSeeked);
+      state.boundVideo.removeEventListener('ratechange', onSponsorRateChange);
       state.boundVideo.removeEventListener('loadedmetadata', onVideoMetadata);
       state.boundVideo.removeEventListener('play', onVideoPlay);
       state.boundVideo.removeEventListener('pause', updateCustomControls);
@@ -1844,11 +2539,14 @@
     }
 
     state.boundVideo = video;
+    adoptSponsorVideo(video, 'bind-video');
     applyStoredVolume(video, true);
     syncStoredVolumeToAllVideos('bind-video', true);
 
-    video.addEventListener('timeupdate', runSkipCheck, { passive: true });
-    video.addEventListener('seeking', runSkipCheck, { passive: true });
+    video.addEventListener('timeupdate', onSponsorTimeUpdate, { passive: true });
+    video.addEventListener('seeking', onSponsorSeeking, { passive: true });
+    video.addEventListener('seeked', onSponsorSeeked, { passive: true });
+    video.addEventListener('ratechange', onSponsorRateChange, { passive: true });
     video.addEventListener('loadedmetadata', onVideoMetadata, { passive: true });
     video.addEventListener('play', onVideoPlay, { passive: true });
     video.addEventListener('pause', updateCustomControls, { passive: true });
@@ -1858,6 +2556,7 @@
     updateVolumeControl();
 
     scheduleRefresh('bind-video');
+    scheduleSponsorWake('bind-video', video);
     syncFullscreenSoon('bind-video');
   }
 
@@ -1874,6 +2573,8 @@
     syncStoredVolumeToAllVideos('metadata', true);
     updateVolumeControl();
     scheduleRefresh('metadata');
+    runSkipCheck(state.boundVideo);
+    scheduleSponsorWake('metadata', state.boundVideo);
     syncFullscreenSoon('metadata');
     runNativeAdSkipCheck('metadata');
   }
@@ -1884,6 +2585,8 @@
     }
     updateVolumeControl();
     scheduleRefresh('play');
+    runSkipCheck(state.boundVideo);
+    scheduleSponsorWake('play', state.boundVideo);
     syncFullscreenSoon('play');
     runNativeAdSkipCheck('play');
   }
@@ -7450,7 +8153,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.20',
+      version: '0.3.22',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -7574,6 +8277,9 @@ html.${APP_ID}-fs-active body {
       sponsorBlockSelfpromoEnabled: CONFIG.categories.includes('selfpromo'),
       sponsorBlockLastFetch: state.lastSponsorBlockFetch,
       sponsorBlockLastError: state.lastSponsorBlockError,
+      sponsorBlockLastSkip: state.lastSponsorSkipResult,
+      sponsorBlockResolvedVideoId: getSponsorVideoId(),
+      sponsorBlockWakeTimerActive: Boolean(state.sponsorWakeTimer),
       sponsorBlockByCategory: (() => {
         const result = {};
         for (const segment of state.segments) {
@@ -7599,6 +8305,7 @@ html.${APP_ID}-fs-active body {
     ensureHomeCleanupStyle();
     bindHomePreviewStopper();
     bindShortsSafeVolumeSync();
+    bindGlobalSponsorMediaSignals();
 
     if (isShortsSafeModePage()) {
       stopShortsRuntimeTasks('init');
