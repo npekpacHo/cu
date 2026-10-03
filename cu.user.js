@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Cleaner mobile YouTube: reliable SponsorBlock, ads, synced volume and fullscreen.
-// @description:ru Чище мобильный YouTube: SponsorBlock, реклама, единая громкость и fullscreen.
+// @description  Cleaner mobile YouTube: SponsorBlock, synced volume, fullscreen and launcher tab control.
+// @description:ru Чище мобильный YouTube: SponsorBlock, единая громкость, fullscreen и контроль ярлыка.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.22
+// @version      0.3.23
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -445,6 +445,20 @@
     // 0.3.20: в safe-mode Shorts возвращаем только синхронизацию громкости.
     shortsSafeVolumeSyncEnabled: true,
     shortsSafeVolumeSyncDelayMs: 120,
+
+    /*
+      0.3.23:
+      ярлык Android ведёт через https://npekpacho.ru/youtube/?launch=1
+      на m.youtube.com/?cu=launcher. Только такой запуск участвует в
+      защите от дублей. Обычные вручную открытые вкладки не закрываем.
+    */
+    launcherSingletonEnabled: true,
+    launcherQueryKey: 'cu',
+    launcherQueryValue: 'launcher',
+    launcherChannelName: 'cu:youtube-tabs:v1',
+    launcherProbeWaitMs: 420,
+    launcherCloseRetryMs: 140,
+    launcherFallbackUrl: 'https://npekpacho.ru/youtube/?duplicate=1',
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -468,6 +482,14 @@
     sponsorSeekInFlight: false,
     sponsorTrace: [],
     lastSponsorVerifiedSeek: null,
+
+    launcherChannel: null,
+    launcherTabId: '',
+    launcherReady: false,
+    launcherWasRequest: false,
+    launcherDuplicateDetected: false,
+    launcherResponder: null,
+    launcherLastEvent: null,
 
     nativeAdPollTimer: 0,
     nativeAdWasActive: false,
@@ -2210,7 +2232,7 @@
       document.querySelector('#movie_player, .html5-video-player');
 
     return {
-      version: '0.3.22',
+      version: '0.3.23',
       api,
       loadedVideoId: state.loadedVideoId,
       loadedSegments: state.segments,
@@ -8153,7 +8175,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.22',
+      version: '0.3.23',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -8257,6 +8279,7 @@ html.${APP_ID}-fs-active body {
       hasCustomControls: Boolean(state.customControlsEl),
       customControlsVisible: Boolean(state.customControlsEl && state.customControlsEl.style.display !== 'none'),
       fullscreenElementTag: (getFullscreenElement() && getFullscreenElement().tagName) || '',
+      launcher: window.cuLauncherInfo?.() || null,
       nativeAdSkipEnabled: CONFIG.nativeAdSkipEnabled,
       nativeAdSkipShouldRun: shouldRunNativeAdSkipTasks(),
       nativeAdPollActive: Boolean(state.nativeAdPollTimer),
@@ -8292,7 +8315,279 @@ html.${APP_ID}-fs-active body {
     };
   };
 
-  function init() {
+
+  function makeLauncherTabId() {
+    try {
+      const stored = sessionStorage.getItem('cu:launcher-tab-id');
+      if (stored) return stored;
+
+      const id = globalThis.crypto?.randomUUID?.()
+        || `cu-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+      sessionStorage.setItem('cu:launcher-tab-id', id);
+      return id;
+    } catch {
+      return `cu-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+  }
+
+  function isLauncherRequest() {
+    if (!CONFIG.launcherSingletonEnabled) return false;
+
+    try {
+      const url = new URL(location.href);
+      return url.searchParams.get(CONFIG.launcherQueryKey) === CONFIG.launcherQueryValue;
+    } catch {
+      return false;
+    }
+  }
+
+  function cleanLauncherMarkerFromUrl() {
+    try {
+      const url = new URL(location.href);
+
+      if (url.searchParams.get(CONFIG.launcherQueryKey) !== CONFIG.launcherQueryValue) {
+        return false;
+      }
+
+      url.searchParams.delete(CONFIG.launcherQueryKey);
+
+      const query = url.searchParams.toString();
+      const clean =
+        `${url.pathname}${query ? `?${query}` : ''}${url.hash || ''}`;
+
+      history.replaceState(history.state, '', clean);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function launcherRecord(stage, data = {}) {
+    state.launcherLastEvent = {
+      stage,
+      at: new Date().toISOString(),
+      ...data,
+    };
+
+    log('launcher', state.launcherLastEvent);
+    return state.launcherLastEvent;
+  }
+
+  function tryFocusCurrentTab() {
+    try {
+      window.focus();
+    } catch {}
+
+    try {
+      document.documentElement?.focus?.({ preventScroll: true });
+    } catch {}
+  }
+
+  function sendLauncherMessage(message) {
+    try {
+      state.launcherChannel?.postMessage({
+        version: 1,
+        from: state.launcherTabId,
+        href: location.href,
+        at: Date.now(),
+        ...message,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function setupLauncherChannel() {
+    if (!CONFIG.launcherSingletonEnabled || typeof BroadcastChannel !== 'function') {
+      return false;
+    }
+
+    if (state.launcherChannel) return true;
+
+    state.launcherTabId = state.launcherTabId || makeLauncherTabId();
+    state.launcherChannel = new BroadcastChannel(CONFIG.launcherChannelName);
+
+    state.launcherChannel.addEventListener('message', (event) => {
+      const message = event?.data;
+
+      if (!message || typeof message !== 'object') return;
+      if (!message.from || message.from === state.launcherTabId) return;
+
+      if (message.type === 'probe') {
+        /*
+          Новая launcher-вкладка во время собственного probe ещё не считается
+          живой основной вкладкой. Иначе два одновременно открытых ярлыка
+          могли бы попытаться закрыть друг друга.
+        */
+        if (!state.launcherReady) return;
+
+        sendLauncherMessage({
+          type: 'alive',
+          probeId: message.probeId || '',
+          responder: state.launcherTabId,
+          title: document.title || '',
+          visible: !document.hidden,
+        });
+        return;
+      }
+
+      if (message.type === 'focus' && message.target === state.launcherTabId) {
+        launcherRecord('focus-request', { from: message.from });
+        tryFocusCurrentTab();
+      }
+    });
+
+    return true;
+  }
+
+  async function probeExistingYoutubeTab() {
+    if (!setupLauncherChannel()) {
+      return { supported: false, duplicate: false, responder: null };
+    }
+
+    const probeId =
+      globalThis.crypto?.randomUUID?.()
+      || `probe-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+    return new Promise((resolve) => {
+      let finished = false;
+      let responder = null;
+
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+
+        try {
+          state.launcherChannel?.removeEventListener('message', onMessage);
+        } catch {}
+
+        resolve({
+          supported: true,
+          duplicate: Boolean(responder),
+          responder,
+        });
+      };
+
+      const onMessage = (event) => {
+        const message = event?.data;
+
+        if (!message || message.type !== 'alive') return;
+        if (message.probeId !== probeId) return;
+        if (!message.from || message.from === state.launcherTabId) return;
+
+        responder = {
+          id: message.from,
+          href: message.href || '',
+          title: message.title || '',
+          visible: Boolean(message.visible),
+        };
+
+        finish();
+      };
+
+      state.launcherChannel.addEventListener('message', onMessage);
+
+      sendLauncherMessage({
+        type: 'probe',
+        probeId,
+      });
+
+      setTimeout(finish, CONFIG.launcherProbeWaitMs);
+    });
+  }
+
+  function closeDuplicateLauncherTab(responder = null) {
+    state.launcherDuplicateDetected = true;
+    state.launcherResponder = responder;
+
+    launcherRecord('duplicate-detected', { responder });
+
+    if (responder?.id) {
+      sendLauncherMessage({
+        type: 'focus',
+        target: responder.id,
+      });
+    }
+
+    /*
+      Chrome обычно запрещает web-странице закрывать обычную вкладку.
+      Но ярлык Android иногда создаёт вкладку с единственной записью истории,
+      поэтому пробуем несколько безопасных вариантов. Если браузер всё равно
+      возражает, уходим на лёгкую служебную страницу вместо второго YouTube.
+    */
+    try {
+      window.close();
+    } catch {}
+
+    setTimeout(() => {
+      try {
+        window.open('', '_self');
+        window.close();
+      } catch {}
+    }, CONFIG.launcherCloseRetryMs);
+
+    setTimeout(() => {
+      try {
+        location.replace(CONFIG.launcherFallbackUrl);
+      } catch {}
+    }, CONFIG.launcherCloseRetryMs * 3);
+  }
+
+  async function initLauncherSingleton() {
+    state.launcherTabId = state.launcherTabId || makeLauncherTabId();
+    state.launcherWasRequest = isLauncherRequest();
+
+    setupLauncherChannel();
+
+    if (!state.launcherWasRequest) {
+      state.launcherReady = true;
+      launcherRecord('normal-tab-ready');
+      return { duplicate: false, launcher: false };
+    }
+
+    launcherRecord('launcher-probe-start');
+
+    const result = await probeExistingYoutubeTab();
+
+    if (result.duplicate) {
+      closeDuplicateLauncherTab(result.responder);
+      return { duplicate: true, launcher: true, responder: result.responder };
+    }
+
+    cleanLauncherMarkerFromUrl();
+    state.launcherReady = true;
+
+    launcherRecord('launcher-became-primary', {
+      broadcastSupported: result.supported,
+    });
+
+    return { duplicate: false, launcher: true };
+  }
+
+  window.cuLauncherInfo = function cuLauncherInfo() {
+    return {
+      enabled: CONFIG.launcherSingletonEnabled,
+      tabId: state.launcherTabId,
+      ready: state.launcherReady,
+      wasLauncherRequest: state.launcherWasRequest,
+      duplicateDetected: state.launcherDuplicateDetected,
+      responder: state.launcherResponder,
+      broadcastChannel: typeof BroadcastChannel === 'function',
+      lastEvent: state.launcherLastEvent,
+      href: location.href,
+    };
+  };
+
+
+  async function init() {
+    const launcherState = await initLauncherSingleton();
+
+    if (launcherState?.duplicate) {
+      return;
+    }
+
     state.currentUrl = location.href;
     state.wasLandscape = isLandscape();
 
@@ -8391,8 +8686,10 @@ html.${APP_ID}-fs-active body {
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init, { once: true });
+    document.addEventListener('DOMContentLoaded', () => {
+      void init();
+    }, { once: true });
   } else {
-    init();
+    void init();
   }
 })();
