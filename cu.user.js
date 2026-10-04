@@ -4,7 +4,7 @@
 // @description  Cleaner mobile YouTube: SponsorBlock, normalized volume, fullscreen and launcher tab control.
 // @description:ru Чище мобильный YouTube: SponsorBlock, нормализация громкости, fullscreen и контроль ярлыка.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.25
+// @version      0.3.26
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -393,6 +393,9 @@
     homeCleanupDisablePreviewAutoplay: true,
     homeCleanupHidePaidContentOverlays: true,
     homeCleanupHideInlinePreviewOverlays: true,
+
+    // 0.3.26: возраст ролика на превью главной, без запросов и глобальных rescans.
+    homeVideoDatesEnabled: true,
 
     /*
       0.3.16:
@@ -2347,7 +2350,7 @@
       document.querySelector('#movie_player, .html5-video-player');
 
     return {
-      version: '0.3.25',
+      version: '0.3.26',
       api,
       loadedVideoId: state.loadedVideoId,
       loadedSegments: state.segments,
@@ -7824,6 +7827,233 @@ html.${APP_ID}-fs-active body {
     return state.lastAmbientShortsCleanupResult;
   };
 
+  // Home dates deliberately do not use player data, network requests or the
+  // channel-filter scanner. Walk only inserted subtrees, with a per-tick budget.
+  const homeDates = {
+    roots: new Map(),
+    cards: new Set(),
+    timer: 0,
+    metadataObserver: null,
+    scans: 0,
+    updates: 0,
+    lastResult: null,
+  };
+
+  const HOME_DATE_CARDS = [
+    'ytm-video-with-context-renderer', 'ytm-compact-video-renderer',
+    'ytm-video-card-renderer', 'ytm-video-renderer', 'ytm-rich-item-renderer',
+    'ytd-rich-item-renderer', 'ytd-video-renderer', 'ytd-rich-grid-media',
+    'yt-lockup-view-model',
+  ].join(',');
+
+  function shouldRunHomeDates() {
+    return CONFIG.homeVideoDatesEnabled && isHomeSafeModePage() && !document.hidden;
+  }
+
+  function readHomeDateText(value) {
+    if (typeof value === 'string') return value;
+    if (typeof value?.content === 'string') return value.content;
+    return textFromRunsLike(value);
+  }
+
+  function matchHomeDateText(value) {
+    const text = String(value || '').replace(/[\u00a0\u202f]/g, ' ').replace(/\s+/g, ' ').trim();
+    // The feed reports relative publication age; don't turn it into a guessed
+    // calendar date. Upcoming premiere dates and live counters are not uploads.
+    if (/(?:начн[её]тся|запланирован|премьера через|scheduled|starts? in|premieres? in)/i.test(text)) return '';
+    const match = text.match(/(?:\d+\s*(?:секунд[ауы]?|минут[ауы]?|час(?:а|ов)?|д(?:ень|ня|ней)|недел(?:я|и|ь|ю)|месяц(?:а|ев)?|год(?:а)?|лет)\s+назад|\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago|\b(?:today|yesterday)\b|(?:^|[\s•·])(?:сегодня|вчера)(?=$|[\s•·]))/i);
+    return match ? match[0].trim() : '';
+  }
+
+  function extractHomeCardDate(card) {
+    // These are card-local renderer objects, never ytInitialData or a neighbouring
+    // player's response. Explicit videoId mismatches reject recycled stale data.
+    const videoId = getVideoIdFromCard(card);
+    const localData = [card.data, card.__data?.data, card.polymerController?.data];
+    for (const root of localData) {
+      const candidates = [root, root?.videoWithContextRenderer, root?.videoRenderer,
+        root?.content?.videoRenderer, root?.content?.videoWithContextRenderer];
+      for (const data of candidates) {
+        if (!data || (data.videoId && data.videoId !== videoId)) continue;
+        const date = matchHomeDateText(readHomeDateText(data.publishedTimeText));
+        if (date) return date;
+      }
+    }
+
+    // CSS ellipsis doesn't remove the hidden date from textContent. Read only
+    // metadata areas: a video title/channel named "3 дня назад" is not a date.
+    const nodes = card.querySelectorAll([
+      '.video-meta .subhead', '.video-meta .secondary-text',
+      '.video-meta .video-meta-stats', '.video-meta .metadata',
+      '.slim-video-metadata', '.media-item-metadata',
+      '.yt-content-metadata-view-model__metadata-row',
+      '.yt-content-metadata-view-model-wiz__metadata-row',
+      '.ytContentMetadataViewModelMetadataRow',
+      'yt-content-metadata-view-model', '#metadata-line',
+      '.metadata-line', '.content-metadata',
+    ].join(','));
+    for (const node of nodes) {
+      const date = matchHomeDateText(node.textContent);
+      if (date) return date;
+    }
+    return '';
+  }
+
+  function updateHomeCardDate(card) {
+    if (!card.isConnected) return;
+    // Outer rich-item wrappers and their inner renderer represent the same card.
+    if (card.querySelector(HOME_DATE_CARDS)) return;
+    homeDates.scans += 1;
+    const oldBadge = card.querySelector('.cu-home-date-badge');
+    const link = getVideoLinkFromCard(card);
+    const videoId = getVideoIdFromCard(card);
+    const isWatch = link && /\/watch(?:\?|$)/.test(link.getAttribute('href') || link.href || '');
+    const date = isWatch && videoId ? extractHomeCardDate(card) : '';
+    const host = card.querySelector([
+      '.media-item-thumbnail-container', '.video-thumbnail-container',
+      'yt-thumbnail-view-model', 'ytm-thumbnail-cover', 'ytd-thumbnail', 'a#thumbnail',
+    ].join(',')) || (link?.querySelector('img') ? link : null);
+
+    if (!date || !host) {
+      if (oldBadge) {
+        oldBadge.parentElement?.classList.remove('cu-home-date-host');
+        oldBadge.remove();
+      }
+      return;
+    }
+    if (oldBadge && oldBadge.parentElement !== host) {
+      oldBadge.parentElement?.classList.remove('cu-home-date-host');
+      oldBadge.remove();
+    }
+    let badge = host.querySelector('.cu-home-date-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'cu-home-date-badge';
+      host.classList.add('cu-home-date-host');
+      host.appendChild(badge);
+    }
+    if (badge.textContent !== date || badge.dataset.cuVideoId !== videoId) {
+      badge.textContent = date;
+      badge.dataset.cuVideoId = videoId;
+      badge.title = `Опубликовано: ${date}`;
+      badge.setAttribute('aria-label', `Опубликовано: ${date}`);
+      homeDates.updates += 1;
+      homeDates.lastResult = { videoId, date };
+    }
+  }
+
+  function ensureHomeDatesStyle() {
+    if (document.getElementById('cu-home-dates-style')) return;
+    const style = document.createElement('style');
+    style.id = 'cu-home-dates-style';
+    style.textContent = `
+      .cu-home-date-host { position: relative !important; }
+      .cu-home-date-badge { display: none !important; }
+      html.cu-home-dates .cu-home-date-badge {
+        display: block !important; position: absolute !important;
+        top: 8px !important; left: 8px !important; right: auto !important;
+        bottom: auto !important; z-index: 3; box-sizing: border-box;
+        max-width: calc(100% - 16px); padding: 4px 7px; border-radius: 5px;
+        background: rgba(0,0,0,.82); color: #fff !important;
+        font: 600 12px/1.25 Roboto, Arial, sans-serif !important;
+        white-space: nowrap; pointer-events: none !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function scheduleHomeDatesWork() {
+    if (!shouldRunHomeDates() || homeDates.timer) return;
+    homeDates.timer = setTimeout(processHomeDatesWork, 80);
+  }
+
+  function queueHomeDateRoot(node) {
+    if (!node || node.nodeType !== 1 || node.closest('.cu-home-date-badge')) return;
+    const card = node.closest(HOME_DATE_CARDS);
+    if (card) homeDates.cards.add(card);
+    // Text/metadata insertion inside an already known card needs no subtree walk.
+    if (card && node !== card) return;
+    if (!homeDates.roots.has(node)) {
+      homeDates.roots.set(node, { walker: document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT), first: true });
+    }
+  }
+
+  function processHomeDatesWork() {
+    homeDates.timer = 0;
+    if (!shouldRunHomeDates()) {
+      homeDates.roots.clear();
+      homeDates.cards.clear();
+      return;
+    }
+    let visited = 0;
+    for (const [root, cursor] of homeDates.roots) {
+      if (!root.isConnected) { homeDates.roots.delete(root); continue; }
+      while (visited < 220) {
+        const node = cursor.first ? root : cursor.walker.nextNode();
+        cursor.first = false;
+        if (!node) { homeDates.roots.delete(root); break; }
+        visited += 1;
+        if (node.matches(HOME_DATE_CARDS)) homeDates.cards.add(node);
+      }
+      if (visited >= 220) break;
+    }
+    let processed = 0;
+    for (const card of homeDates.cards) {
+      homeDates.cards.delete(card);
+      try { updateHomeCardDate(card); } catch (error) { log('home date failed', error); }
+      if (++processed >= 24) break;
+    }
+    if (homeDates.roots.size || homeDates.cards.size) scheduleHomeDatesWork();
+  }
+
+  function onHomeDatesMutations(records) {
+    if (!shouldRunHomeDates()) return;
+    for (const record of records) {
+      if (record.target.nodeType === 1 && record.target.closest('.cu-home-date-badge')) continue;
+      const changed = [...record.addedNodes, ...record.removedNodes];
+      // Ignore our own insertions/text writes, so the badges cannot feed a loop.
+      if (changed.length && changed.every(node =>
+        node.nodeType === 1 && node.classList.contains('cu-home-date-badge'))) continue;
+      const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+      if (target?.closest('.cu-home-date-badge')) continue;
+      const card = target?.closest(HOME_DATE_CARDS);
+      if (card) homeDates.cards.add(card);
+      for (const node of record.addedNodes) queueHomeDateRoot(node);
+    }
+    if (homeDates.roots.size || homeDates.cards.size) scheduleHomeDatesWork();
+  }
+
+  function syncHomeDatesRoute() {
+    const active = CONFIG.homeVideoDatesEnabled && isHomeSafeModePage();
+    document.documentElement?.classList.toggle('cu-home-dates', active);
+    clearTimeout(homeDates.timer);
+    homeDates.metadataObserver?.disconnect();
+    homeDates.timer = 0;
+    homeDates.roots.clear();
+    homeDates.cards.clear();
+    if (!active) return;
+    ensureHomeDatesStyle();
+    // Track in-place text/href updates separately, so ordinary player/Shorts
+    // mutations never gain additional work in the existing global observer.
+    homeDates.metadataObserver ||= new MutationObserver(onHomeDatesMutations);
+    homeDates.metadataObserver.observe(document.documentElement, {
+      subtree: true, characterData: true, attributes: true, attributeFilter: ['href'],
+    });
+    queueHomeDateRoot(document.body || document.documentElement);
+    scheduleHomeDatesWork();
+  }
+
+  window.cuHomeDatesInfo = function cuHomeDatesInfo() {
+    return { enabled: CONFIG.homeVideoDatesEnabled, active: shouldRunHomeDates(),
+      scans: homeDates.scans, updates: homeDates.updates, pendingRoots: homeDates.roots.size,
+      pendingCards: homeDates.cards.size, lastResult: homeDates.lastResult };
+  };
+
+  window.cuRefreshHomeDates = function cuRefreshHomeDates() {
+    syncHomeDatesRoute();
+    return window.cuHomeDatesInfo();
+  };
+
   function shouldRunHomeCleanupTasks() {
     return Boolean(CONFIG.homeCleanupEnabled && isHomeSafeModePage());
   }
@@ -8110,6 +8340,7 @@ html.${APP_ID}-fs-active body {
     if (href === state.currentUrl) return;
 
     state.currentUrl = href;
+    syncHomeDatesRoute();
     updateShortsRouteClass(reason);
     state.videoId = '';
     state.loadedVideoId = '';
@@ -8190,7 +8421,7 @@ html.${APP_ID}-fs-active body {
     try {
       if (!document.documentElement) return;
 
-      state.observer = new MutationObserver(() => {
+      state.observer = new MutationObserver((records) => {
         if (location.href !== state.currentUrl) {
           onUrlMaybeChanged('mutation-url');
           return;
@@ -8211,6 +8442,7 @@ html.${APP_ID}-fs-active body {
           чистку чипов, без обхода карточек, Shorts и всех video.
         */
         if (isHomeSafeModePage() && CONFIG.homeSafeModeDisableMutationHeavyTasks) {
+          onHomeDatesMutations(records);
           scheduleHomeChipsCleanup('mutation-home-safe');
           scheduleHomeCleanup('mutation-home-safe', CONFIG.homeCleanupMutationDelayMs);
           scheduleHomePoop('mutation-home-safe', CONFIG.homePoopMutationDelayMs);
@@ -8290,7 +8522,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.25',
+      version: '0.3.26',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -8711,6 +8943,7 @@ html.${APP_ID}-fs-active body {
     installFullscreenWatchers();
     installDoubleTapSeek();
     installMutationObserver();
+    syncHomeDatesRoute();
     syncNativeAdPoll('init');
     ensureHomeCleanupStyle();
     bindHomePreviewStopper();
@@ -8759,6 +8992,7 @@ html.${APP_ID}-fs-active body {
       }
 
       if (!document.hidden) {
+        syncHomeDatesRoute();
         if (isShortsSafeModePage()) {
           stopShortsRuntimeTasks('visibility');
           scheduleShortsVolumeNormalizeBurst('visibility-shorts');
