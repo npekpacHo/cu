@@ -4,7 +4,7 @@
 // @description  Cleaner mobile YouTube: SponsorBlock, normalized volume, fullscreen and launcher tab control.
 // @description:ru Чище мобильный YouTube: SponsorBlock, нормализация громкости, fullscreen и контроль ярлыка.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.26
+// @version      0.3.27
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -448,6 +448,10 @@
     // 0.3.20: в safe-mode Shorts возвращаем только синхронизацию громкости.
     shortsSafeVolumeSyncEnabled: true,
     shortsSafeVolumeSyncDelayMs: 120,
+
+    // 0.3.27: manual Shorts action only. No automatic blacklist scanning.
+    shortsManualPoopEnabled: true,
+    shortsManualPoopStorageKey: 'cu:shorts-manual-blacklist:v1',
 
     /*
       0.3.25:
@@ -2350,7 +2354,7 @@
       document.querySelector('#movie_player, .html5-video-player');
 
     return {
-      version: '0.3.26',
+      version: '0.3.27',
       api,
       loadedVideoId: state.loadedVideoId,
       loadedSegments: state.segments,
@@ -6497,6 +6501,278 @@ html.${APP_ID}-fs-active body {
 
 
 
+  // Isolated manual implementation. The legacy Shorts scanner, feedback and
+  // multi-gesture navigation stay behind safe-mode throughout this release.
+  const manualPoop = { button: null, action: null, lastResult: null, bound: false };
+  const MANUAL_SHORT_ROOTS = [
+    '.ytReelPlayerOverlayViewModelHost', 'reel-player-overlay-view-model',
+    'ytm-reel-player-overlay-renderer', 'reel-player-overlay-renderer',
+    'ytm-reel-video-renderer', 'ytm-shorts-video-view-model', 'ytm-shorts-player',
+  ].join(',');
+  const MANUAL_MENU_SURFACES = [
+    '.ytSpecBottomSheetLayoutHost', 'ytm-bottom-sheet-renderer',
+    'ytm-menu-popup-renderer', 'tp-yt-iron-dropdown', '[role="menu"]', '[role="dialog"]',
+  ].join(',');
+
+  function manualPoopEnabled() {
+    return CONFIG.shortsManualPoopEnabled && (isShortsPage() || isSourceShortsPage());
+  }
+
+  function manualShortRootId(root) {
+    const data = root.data || root.__data?.data;
+    const id = root.getAttribute('data-video-id') || root.getAttribute('video-id') || data?.videoId;
+    if (isValidVideoId(id)) return id;
+    const ids = new Set(Array.from(root.querySelectorAll('a[href*="/shorts/"]'))
+      .map(link => getVideoIdFromHref(link.getAttribute('href'))).filter(Boolean));
+    return ids.size === 1 ? [...ids][0] : '';
+  }
+
+  function manualShortChannel(root) {
+    const channels = new Map();
+    for (const link of root.querySelectorAll('a[href]')) {
+      try {
+        const url = new URL(link.getAttribute('href'), location.origin);
+        if (!['m.youtube.com', 'www.youtube.com', 'youtube.com'].includes(url.hostname)) continue;
+        const match = url.pathname.match(/^\/(channel\/UC[\w-]{22}|@[^/]+)(?:\/|$)/);
+        if (!match) continue;
+        const path = `/${match[1]}`;
+        channels.set(path, { key: path, channelId: path.startsWith('/channel/') ? path.slice(9) : '',
+          handle: path.startsWith('/@') ? path.slice(1) : '',
+          name: String(link.textContent || link.getAttribute('aria-label') || path).trim() });
+      } catch {}
+    }
+    // Multiple distinct channel links can include the music author/preloaded
+    // neighbours. Save only the video in that case, never guess by display name.
+    return channels.size === 1 ? [...channels.values()][0] : null;
+  }
+
+  function getManualShortContext() {
+    if (!manualPoopEnabled()) return null;
+    const urlId = getShortsVideoIdFromUrl() || getVideoIdFromHref(location.href);
+    const candidates = [];
+    for (const root of Array.from(document.querySelectorAll(MANUAL_SHORT_ROOTS)).slice(0, 24)) {
+      if (!isElementVisible(root) || root.getAttribute('aria-hidden') === 'true') continue;
+      const id = manualShortRootId(root);
+      if (id && urlId && id !== urlId) continue;
+      if (!root.querySelector('.ytReelPlayerOverlayViewModelActionsContainer, reel-action-bar-view-model, button, [role="button"]')) continue;
+      const videoId = id || urlId;
+      if (!videoId) continue;
+      const video = root.querySelector('video');
+      let score = id && id === urlId ? 100 : 0;
+      if (root.hasAttribute('is-active') || root.getAttribute('aria-hidden') === 'false') score += 30;
+      if (video && !video.paused && !video.ended) score += 20;
+      // Prefer a local overlay over a parent containing several reels.
+      score -= root.querySelectorAll(MANUAL_SHORT_ROOTS).length * 10;
+      candidates.push({ root, video, videoId, score, channel: manualShortChannel(root),
+        source: video?.currentSrc || video?.src || '' });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    if (!candidates.length || (candidates[1] && candidates[0].score === candidates[1].score)) return null;
+    return candidates[0];
+  }
+
+  function manualPoopContextStillCurrent(action) {
+    if (manualPoop.action !== action || action.cancelled || document.hidden) return false;
+    const current = getManualShortContext();
+    return Boolean(current && current.root === action.context.root &&
+      current.videoId === action.context.videoId && current.source === action.context.source &&
+      (current.channel?.key || '') === (action.context.channel?.key || ''));
+  }
+
+  function readManualShortsBlacklist() {
+    const raw = localStorage.getItem(CONFIG.shortsManualPoopStorageKey);
+    if (!raw) return { version: 1, videos: [], channels: [] };
+    const value = JSON.parse(raw);
+    if (value.version !== 1 || !Array.isArray(value.videos) || !Array.isArray(value.channels)) {
+      throw new Error('Некорректный формат ЧС');
+    }
+    return value;
+  }
+
+  function saveManualShortsBlacklist(context) {
+    const value = readManualShortsBlacklist();
+    const at = new Date().toISOString();
+    if (!value.videos.some(item => item.id === context.videoId)) {
+      value.videos.push({ id: context.videoId, channelKey: context.channel?.key || '', blockedAt: at });
+    }
+    if (context.channel && !value.channels.some(item => item.key === context.channel.key)) {
+      value.channels.push({ ...context.channel, blockedAt: at });
+    }
+    localStorage.setItem(CONFIG.shortsManualPoopStorageKey, JSON.stringify(value));
+    const saved = readManualShortsBlacklist();
+    if (!saved.videos.some(item => item.id === context.videoId) ||
+      (context.channel && !saved.channels.some(item => item.key === context.channel.key))) {
+      throw new Error('Запись ЧС не подтвердилась');
+    }
+  }
+
+  function findManualShortsMore(root) {
+    const found = new Set();
+    for (const node of root.querySelectorAll('button, [role="button"], c3-icon-button, [aria-label]')) {
+      const button = node.closest('button, [role="button"]') || node;
+      if (found.has(button) || !isElementVisible(button)) continue;
+      const label = normalizeUiText(node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent);
+      if (/^(?:еще|другие действия|дополнительные действия|больше действий|more|more actions|more options|меню|menu)$/.test(label)) found.add(button);
+    }
+    return found.size === 1 ? [...found][0] : null;
+  }
+
+  function visibleManualMenuSurfaces() {
+    return Array.from(document.querySelectorAll(MANUAL_MENU_SURFACES)).filter(isElementVisible);
+  }
+
+  function findManualNotInterested(surface) {
+    return Array.from(surface.querySelectorAll('button[role="menuitem"]')).find(button => {
+      const label = normalizeUiText(button.getAttribute('aria-label') ||
+        button.querySelector('.ytListItemViewModelTitle')?.textContent || button.textContent);
+      return isElementVisible(button) && ['не интересует', 'не интересно', 'not interested'].includes(label);
+    }) || null;
+  }
+
+  async function manualPoopWait(action, ms) {
+    await new Promise(resolve => {
+      action.wake = resolve;
+      action.timer = setTimeout(resolve, ms);
+    });
+    clearTimeout(action.timer);
+    action.timer = 0;
+    action.wake = null;
+    return manualPoopContextStillCurrent(action);
+  }
+
+  function cancelManualPoop(reason) {
+    const action = manualPoop.action;
+    if (!action) return;
+    action.cancelled = reason;
+    clearTimeout(action.timer);
+    action.wake?.();
+  }
+
+  function closeOwnedManualMenu(action) {
+    if (!manualPoopContextStillCurrent(action) || !action.surface?.isConnected) return;
+    const close = Array.from(action.surface.querySelectorAll('button, [role="button"]')).find(button =>
+      isElementVisible(button) && /^(?:закрыть|close)$/.test(normalizeUiText(button.getAttribute('aria-label') || button.textContent)));
+    if (close) close.click();
+    else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+  }
+
+  async function handleManualShortsPoop() {
+    if (!manualPoopEnabled() || manualPoop.action) return;
+    const context = getManualShortContext();
+    if (!context) {
+      manualPoop.lastResult = { status: 'identity-unavailable' };
+      toast(`${APP_SHORT}: текущий Shorts ещё не определён`, 1400);
+      return;
+    }
+    const action = { context, cancelled: '', timer: 0, wake: null, surface: null };
+    const result = { videoId: context.videoId, channel: context.channel, saved: false,
+      native: 'not-started', status: 'started', at: new Date().toISOString() };
+    manualPoop.action = action;
+    manualPoop.button.disabled = true;
+    try {
+      saveManualShortsBlacklist(context);
+      result.saved = true;
+      const more = findManualShortsMore(context.root);
+      if (!more) { result.native = 'more-not-found'; return; }
+      // Never reuse an already open menu from another action/card.
+      if (visibleManualMenuSurfaces().length) { result.native = 'menu-already-open'; return; }
+      if (!manualPoopContextStillCurrent(action)) { result.native = 'cancelled'; return; }
+      more.click(); // One native click; no synthetic pointer/keyboard gesture chain.
+      result.native = 'item-not-found';
+      const deadline = Date.now() + 1600;
+      while (Date.now() < deadline) {
+        if (!await manualPoopWait(action, 80)) {
+          action.cancelled ||= 'context-changed'; result.native = 'cancelled'; return;
+        }
+        for (const surface of visibleManualMenuSurfaces()) {
+          action.surface = surface;
+          const item = findManualNotInterested(surface);
+          if (!item) continue;
+          if (!manualPoopContextStillCurrent(action)) { result.native = 'cancelled'; return; }
+          item.click();
+          result.native = 'clicked';
+          // Observe UI handling only. No extra swipe/scroll after the native click.
+          await manualPoopWait(action, 250);
+          result.native = action.cancelled === 'user-gesture' ? 'clicked-unconfirmed' :
+            !surface.isConnected || !isElementVisible(surface) ||
+            !manualPoopContextStillCurrent(action) ? 'ui-handled' : 'clicked-unconfirmed';
+          return;
+        }
+      }
+      closeOwnedManualMenu(action);
+    } catch (error) {
+      result.error = String(error?.message || error);
+      result.native = result.saved ? 'error' : 'storage-error';
+    } finally {
+      result.status = result.native === 'cancelled' ? 'cancelled' : result.saved ? 'saved' : 'failed';
+      manualPoop.lastResult = result;
+      manualPoop.action = null;
+      manualPoop.button.disabled = false;
+      if (manualPoopEnabled() && !action.cancelled) {
+        const stored = context.channel ? 'ролик и канал в ЧС' : 'ролик в ЧС';
+        const feedback = result.native === 'ui-handled' ? ' · Не интересует' :
+          result.native === 'clicked-unconfirmed' ? ' · действие YouTube не подтверждено' : ' · пункт «Не интересует» не сработал';
+        toast(result.saved ? `${APP_SHORT}: ${stored}${feedback}` :
+          `${APP_SHORT}: не удалось сохранить ЧС`, 1600);
+      }
+    }
+  }
+
+  function syncManualShortsPoop(reason = 'route') {
+    cancelManualPoop(reason);
+    if (!CONFIG.shortsManualPoopEnabled) return;
+    if (!manualPoop.button && manualPoopEnabled()) {
+      const style = document.createElement('style');
+      style.id = 'cu-shorts-manual-poop-style';
+      style.textContent = `
+        #cu-shorts-manual-poop { position: fixed; right: 12px; top: 74px;
+          z-index: 2100; width: 48px; height: 48px; padding: 0; border: 0;
+          border-radius: 50%; background: rgba(20,20,20,.65); color: white;
+          font: 30px/48px system-ui; cursor: pointer; touch-action: manipulation; }
+        #cu-shorts-manual-poop:disabled { opacity: .45; }
+        #cu-shorts-manual-poop[hidden] { display: none !important; }
+      `;
+      (document.head || document.documentElement).appendChild(style);
+      const button = document.createElement('button');
+      button.id = 'cu-shorts-manual-poop';
+      button.type = 'button';
+      button.textContent = '💩';
+      button.title = 'В ЧС и «Не интересует»';
+      button.setAttribute('aria-label', 'Скрыть Shorts и его канал');
+      button.addEventListener('click', event => {
+        event.preventDefault(); event.stopPropagation();
+        void handleManualShortsPoop();
+      });
+      manualPoop.button = button;
+    }
+    if (manualPoop.button) {
+      if (!manualPoop.button.isConnected) (document.body || document.documentElement).appendChild(manualPoop.button);
+      manualPoop.button.hidden = !manualPoopEnabled() || document.hidden;
+    }
+    if (!manualPoop.bound) {
+      manualPoop.bound = true;
+      // Any real gesture elsewhere yields to the user immediately, including a
+      // swipe before YouTube has had time to update URL/player metadata.
+      const interrupt = event => {
+        if (manualPoop.action && !manualPoop.button?.contains(event.target)) cancelManualPoop('user-gesture');
+      };
+      document.addEventListener('pointerdown', interrupt, { capture: true, passive: true });
+      document.addEventListener('touchstart', interrupt, { capture: true, passive: true });
+    }
+  }
+
+  window.cuShortsPoopInfo = function cuShortsPoopInfo() {
+    let blacklist;
+    try { const value = readManualShortsBlacklist(); blacklist = { videos: value.videos.length, channels: value.channels.length }; }
+    catch (error) { blacklist = { error: String(error?.message || error) }; }
+    const context = getManualShortContext();
+    return { enabled: CONFIG.shortsManualPoopEnabled, active: manualPoopEnabled(),
+      busy: Boolean(manualPoop.action), currentVideoId: context?.videoId || '',
+      currentChannel: context?.channel || null, blacklist, lastResult: manualPoop.lastResult,
+      autoSkipEnabled: false };
+  };
+  window.cuShortsManualBlacklist = function cuShortsManualBlacklist() { return readManualShortsBlacklist(); };
+
   function getShortsActionBarRoot() {
     try {
       const currentRoot = getCurrentShortsRoot();
@@ -8340,6 +8616,7 @@ html.${APP_ID}-fs-active body {
     if (href === state.currentUrl) return;
 
     state.currentUrl = href;
+    syncManualShortsPoop(reason);
     syncHomeDatesRoute();
     updateShortsRouteClass(reason);
     state.videoId = '';
@@ -8522,7 +8799,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.26',
+      version: '0.3.27',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -8949,6 +9226,7 @@ html.${APP_ID}-fs-active body {
     bindHomePreviewStopper();
     bindShortsSafeVolumeSync();
     bindGlobalSponsorMediaSignals();
+    syncManualShortsPoop('init');
 
     if (isShortsSafeModePage()) {
       stopShortsRuntimeTasks('init');
@@ -8986,6 +9264,7 @@ html.${APP_ID}-fs-active body {
     }
 
     document.addEventListener('visibilitychange', () => {
+      syncManualShortsPoop('visibility');
       if (document.hidden) {
         stopNativeAdPoll('hidden');
         return;
