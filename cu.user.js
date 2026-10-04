@@ -4,7 +4,7 @@
 // @description  Cleaner mobile YouTube: SponsorBlock, synced volume, fullscreen and launcher tab control.
 // @description:ru Чище мобильный YouTube: SponsorBlock, единая громкость, fullscreen и контроль ярлыка.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.23
+// @version      0.3.24
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -448,7 +448,7 @@
 
     /*
       0.3.23:
-      ярлык Android ведёт через https://npekpacho.ru/youtube/?launch=1
+      ярлык Android ведёт через https://npekpacho.ru/y/?launch=1
       на m.youtube.com/?cu=launcher. Только такой запуск участвует в
       защите от дублей. Обычные вручную открытые вкладки не закрываем.
     */
@@ -458,7 +458,7 @@
     launcherChannelName: 'cu:youtube-tabs:v1',
     launcherProbeWaitMs: 420,
     launcherCloseRetryMs: 140,
-    launcherFallbackUrl: 'https://npekpacho.ru/youtube/?duplicate=1',
+    launcherFallbackUrl: 'https://npekpacho.ru/y/?duplicate=1',
   };
 
   const SB_API = 'https://sponsor.ajay.app';
@@ -2232,7 +2232,7 @@
       document.querySelector('#movie_player, .html5-video-player');
 
     return {
-      version: '0.3.23',
+      version: '0.3.24',
       api,
       loadedVideoId: state.loadedVideoId,
       loadedSegments: state.segments,
@@ -8175,7 +8175,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.23',
+      version: '0.3.24',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
