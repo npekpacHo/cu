@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         YouTube Crutches
 // @name:ru      Костыли для Ютуба
-// @description  Cleaner mobile YouTube: SponsorBlock, synced volume, fullscreen and launcher tab control.
-// @description:ru Чище мобильный YouTube: SponsorBlock, единая громкость, fullscreen и контроль ярлыка.
+// @description  Cleaner mobile YouTube: SponsorBlock, normalized volume, fullscreen and launcher tab control.
+// @description:ru Чище мобильный YouTube: SponsorBlock, нормализация громкости, fullscreen и контроль ярлыка.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.24
+// @version      0.3.25
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -447,6 +447,16 @@
     shortsSafeVolumeSyncDelayMs: 120,
 
     /*
+      0.3.25:
+      мобильный YouTube может повторно выставить громкость Shorts уже после
+      play/loadedmetadata. Поэтому активный Shorts нормализуется несколькими
+      лёгкими повторами без возврата тяжёлого DOM-сканирования.
+    */
+    shortsVolumeNormalizeEnabled: true,
+    shortsVolumeNormalizeRetriesMs: [0, 420, 1100, 2200],
+    shortsVolumeNormalizeToleranceSlider: 1,
+
+    /*
       0.3.23:
       ярлык Android ведёт через https://npekpacho.ru/y/?launch=1
       на m.youtube.com/?cu=launcher. Только такой запуск участвует в
@@ -536,6 +546,7 @@
     lastAmbientShortsCleanupResult: null,
     shortsTransitionTimer: 0,
     shortsSafeVolumeTimer: 0,
+    shortsVolumeNormalizeTimerIds: [],
     lastShortsSafeVolumeResult: null,
     lastCardFeedbackResult: null,
     cardFeedbackBusyUntilMs: 0,
@@ -857,6 +868,7 @@
       clearTimeout(state.shortsVolumeHideTimer);
       clearTimeout(state.customControlsHideTimer);
       clearTimeout(state.shortsSafeVolumeTimer);
+      clearShortsVolumeNormalizeTimers();
 
       state.bindTimer = 0;
       state.refreshTimer = 0;
@@ -894,7 +906,7 @@
       }
 
       if (shouldRunShortsSafeVolumeSync()) {
-        scheduleShortsSafeVolume(`${reason}-volume`, 0);
+        scheduleShortsVolumeNormalizeBurst(`${reason}-volume`);
       }
 
       log('Shorts safe-mode active:', reason);
@@ -913,32 +925,85 @@
     );
   }
 
+  function clearShortsVolumeNormalizeTimers() {
+    try {
+      for (const timerId of state.shortsVolumeNormalizeTimerIds) {
+        clearTimeout(timerId);
+      }
+    } catch {}
+
+    state.shortsVolumeNormalizeTimerIds = [];
+  }
+
+  function getShortsVolumeTarget() {
+    const stored = readStoredVolumePercent();
+
+    if (stored !== null) {
+      return {
+        slider: stored,
+        actual: sliderPercentToActualVolumePercent(stored),
+        source: 'stored',
+      };
+    }
+
+    try {
+      const ordinary = state.volumeAppliedVideo;
+
+      if (
+        ordinary &&
+        ordinary.isConnected &&
+        String(ordinary.tagName || '').toLowerCase() === 'video'
+      ) {
+        const slider = getVideoVolumePercent(ordinary);
+
+        return {
+          slider,
+          actual: sliderPercentToActualVolumePercent(slider),
+          source: 'ordinary-video',
+        };
+      }
+    } catch {}
+
+    return null;
+  }
+
   function applyStoredVolumeToShortsVideo(video, reason = 'shorts-safe-volume') {
     if (!shouldRunShortsSafeVolumeSync()) return false;
     if (!video || String(video.tagName || '').toLowerCase() !== 'video') return false;
 
-    const stored = readStoredVolumePercent();
-    if (stored === null) return false;
+    const target = getShortsVolumeTarget();
+    if (!target) return false;
 
     try {
       const beforeSlider = getVideoVolumePercent(video);
       const beforeActual = getVideoActualVolumePercent(video);
+      const tolerance = Number(CONFIG.shortsVolumeNormalizeToleranceSlider) || 1;
 
-      const changed = setSingleVideoVolume(video, stored);
+      const alreadyCorrect =
+        Math.abs(beforeSlider - target.slider) < tolerance &&
+        !(target.slider > 0 && video.muted);
+
+      let changed = false;
+
+      if (!alreadyCorrect) {
+        changed = setSingleVideoVolume(video, target.slider);
+      }
 
       state.lastShortsSafeVolumeResult = {
         reason,
-        storedSlider: stored,
-        mappedActual: sliderPercentToActualVolumePercent(stored),
+        targetSource: target.source,
+        targetSlider: target.slider,
+        targetActual: target.actual,
         beforeSlider,
         beforeActual,
         afterSlider: getVideoVolumePercent(video),
         afterActual: getVideoActualVolumePercent(video),
+        alreadyCorrect,
         changed,
         at: new Date().toISOString(),
       };
 
-      return changed;
+      return changed || alreadyCorrect;
     } catch (error) {
       state.lastShortsSafeVolumeResult = {
         reason,
@@ -988,12 +1053,12 @@
     }
   }
 
-  function syncShortsSafeVolume(reason = 'shorts-safe-volume') {
+  function syncShortsSafeVolume(reason = 'shorts-safe-volume', video = null) {
     if (!shouldRunShortsSafeVolumeSync()) return false;
 
-    const video = findActiveShortsVideoLightweight();
+    const targetVideo = video || findActiveShortsVideoLightweight();
 
-    if (!video) {
+    if (!targetVideo) {
       state.lastShortsSafeVolumeResult = {
         reason,
         foundVideo: false,
@@ -1002,16 +1067,46 @@
       return false;
     }
 
-    return applyStoredVolumeToShortsVideo(video, reason);
+    return applyStoredVolumeToShortsVideo(targetVideo, reason);
   }
 
-  function scheduleShortsSafeVolume(reason = 'shorts-safe-volume', delay = CONFIG.shortsSafeVolumeSyncDelayMs) {
+  function scheduleShortsSafeVolume(
+    reason = 'shorts-safe-volume',
+    delay = CONFIG.shortsSafeVolumeSyncDelayMs,
+    video = null,
+  ) {
     if (!shouldRunShortsSafeVolumeSync()) return;
 
     clearTimeout(state.shortsSafeVolumeTimer);
     state.shortsSafeVolumeTimer = setTimeout(() => {
-      syncShortsSafeVolume(reason);
+      syncShortsSafeVolume(reason, video);
     }, delay);
+  }
+
+  function scheduleShortsVolumeNormalizeBurst(reason = 'shorts-normalize', video = null) {
+    if (!shouldRunShortsSafeVolumeSync()) return;
+
+    if (!CONFIG.shortsVolumeNormalizeEnabled) {
+      scheduleShortsSafeVolume(reason, CONFIG.shortsSafeVolumeSyncDelayMs, video);
+      return;
+    }
+
+    clearShortsVolumeNormalizeTimers();
+
+    const delays = Array.isArray(CONFIG.shortsVolumeNormalizeRetriesMs)
+      ? CONFIG.shortsVolumeNormalizeRetriesMs
+      : [0, 420, 1100, 2200];
+
+    for (const rawDelay of delays) {
+      const delay = Math.max(0, Number(rawDelay) || 0);
+
+      const timerId = setTimeout(() => {
+        const targetVideo = video?.isConnected ? video : null;
+        syncShortsSafeVolume(`${reason}:${delay}`, targetVideo);
+      }, delay);
+
+      state.shortsVolumeNormalizeTimerIds.push(timerId);
+    }
   }
 
   function bindShortsSafeVolumeSync() {
@@ -1021,47 +1116,67 @@
       const video = event.target;
       if (!video || String(video.tagName || '').toLowerCase() !== 'video') return;
 
-      if (event.type === 'play' || event.type === 'loadedmetadata') {
-        applyStoredVolumeToShortsVideo(video, `shorts-${event.type}`);
+      if (
+        event.type === 'play' ||
+        event.type === 'playing' ||
+        event.type === 'loadedmetadata' ||
+        event.type === 'canplay'
+      ) {
+        scheduleShortsVolumeNormalizeBurst(`shorts-${event.type}`, video);
         return;
       }
 
       if (event.type === 'volumechange') {
-        // Наше изменение само вызывает volumechange — его не ловим по кругу.
-        if (Date.now() <= state.volumeInternalChangeUntilMs) return;
+        const target = getShortsVolumeTarget();
+        if (!target) return;
 
-        const stored = readStoredVolumePercent();
-        if (stored === null) return;
+        if (Date.now() <= state.volumeInternalChangeUntilMs) {
+          const wait = Math.max(
+            40,
+            state.volumeInternalChangeUntilMs - Date.now() + 50,
+          );
+
+          scheduleShortsSafeVolume('shorts-volumechange-after-guard', wait, video);
+          return;
+        }
 
         const current = getVideoVolumePercent(video);
+        const tolerance = Number(CONFIG.shortsVolumeNormalizeToleranceSlider) || 1;
 
-        if (Math.abs(current - stored) >= 1 || (stored > 0 && video.muted)) {
-          setTimeout(() => {
-            applyStoredVolumeToShortsVideo(video, 'shorts-volume-reset');
-          }, 0);
+        if (
+          Math.abs(current - target.slider) >= tolerance ||
+          (target.slider > 0 && video.muted)
+        ) {
+          scheduleShortsVolumeNormalizeBurst('shorts-volume-reset', video);
         }
       }
     };
 
     document.addEventListener('play', onMediaEvent, true);
+    document.addEventListener('playing', onMediaEvent, true);
     document.addEventListener('loadedmetadata', onMediaEvent, true);
+    document.addEventListener('canplay', onMediaEvent, true);
     document.addEventListener('volumechange', onMediaEvent, true);
   }
 
   window.cuShortsVolumeInfo = function cuShortsVolumeInfo() {
-    const stored = readStoredVolumePercent();
+    const target = getShortsVolumeTarget();
 
     return {
       enabled: CONFIG.shortsSafeVolumeSyncEnabled,
+      normalizeEnabled: CONFIG.shortsVolumeNormalizeEnabled,
       active: shouldRunShortsSafeVolumeSync(),
-      storedSlider: stored,
-      mappedActual: stored === null ? null : sliderPercentToActualVolumePercent(stored),
+      targetSlider: target?.slider ?? null,
+      targetActual: target?.actual ?? null,
+      targetSource: target?.source ?? null,
+      retriesMs: [...CONFIG.shortsVolumeNormalizeRetriesMs],
       lastResult: state.lastShortsSafeVolumeResult,
     };
   };
 
   window.cuSyncShortsVolume = function cuSyncShortsVolume() {
-    return syncShortsSafeVolume('manual-console');
+    scheduleShortsVolumeNormalizeBurst('manual-console');
+    return window.cuShortsVolumeInfo();
   };
 
 
@@ -2232,7 +2347,7 @@
       document.querySelector('#movie_player, .html5-video-player');
 
     return {
-      version: '0.3.24',
+      version: '0.3.25',
       api,
       loadedVideoId: state.loadedVideoId,
       loadedSegments: state.segments,
@@ -8006,7 +8121,7 @@ html.${APP_ID}-fs-active body {
 
     if (isShortsSafeModePage()) {
       stopShortsRuntimeTasks(reason);
-      scheduleShortsSafeVolume(`${reason}-route`, 0);
+      scheduleShortsVolumeNormalizeBurst(`${reason}-route`);
       return;
     }
 
@@ -8175,7 +8290,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.24',
+      version: '0.3.25',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -8604,7 +8719,7 @@ html.${APP_ID}-fs-active body {
 
     if (isShortsSafeModePage()) {
       stopShortsRuntimeTasks('init');
-      scheduleShortsSafeVolume('init-shorts', 0);
+      scheduleShortsVolumeNormalizeBurst('init-shorts');
     } else {
       scheduleBind();
     }
@@ -8646,7 +8761,7 @@ html.${APP_ID}-fs-active body {
       if (!document.hidden) {
         if (isShortsSafeModePage()) {
           stopShortsRuntimeTasks('visibility');
-          scheduleShortsSafeVolume('visibility-shorts', 0);
+          scheduleShortsVolumeNormalizeBurst('visibility-shorts');
           return;
         }
 
