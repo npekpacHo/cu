@@ -4,7 +4,7 @@
 // @description  Cleaner mobile YouTube: SponsorBlock, normalized volume, fullscreen and launcher tab control.
 // @description:ru Чище мобильный YouTube: SponsorBlock, нормализация громкости, fullscreen и контроль ярлыка.
 // @namespace    https://github.com/npekpacHo/cu
-// @version      0.3.27
+// @version      0.3.28
 // @author       npekpacHo
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=youtube.com
@@ -449,7 +449,7 @@
     shortsSafeVolumeSyncEnabled: true,
     shortsSafeVolumeSyncDelayMs: 120,
 
-    // 0.3.27: manual Shorts action only. No automatic blacklist scanning.
+    // 0.3.28: manual Shorts button, mounted after native UI is ready.
     shortsManualPoopEnabled: true,
     shortsManualPoopStorageKey: 'cu:shorts-manual-blacklist:v1',
 
@@ -2354,7 +2354,7 @@
       document.querySelector('#movie_player, .html5-video-player');
 
     return {
-      version: '0.3.27',
+      version: '0.3.28',
       api,
       loadedVideoId: state.loadedVideoId,
       loadedSegments: state.segments,
@@ -6503,7 +6503,8 @@ html.${APP_ID}-fs-active body {
 
   // Isolated manual implementation. The legacy Shorts scanner, feedback and
   // multi-gesture navigation stay behind safe-mode throughout this release.
-  const manualPoop = { button: null, action: null, lastResult: null, bound: false };
+  const manualPoop = { button: null, slot: null, action: null, lastResult: null,
+    bound: false, mountTimers: [], mountAttempts: 0, uiStatus: 'idle', uiError: '' };
   const MANUAL_SHORT_ROOTS = [
     '.ytReelPlayerOverlayViewModelHost', 'reel-player-overlay-view-model',
     'ytm-reel-player-overlay-renderer', 'reel-player-overlay-renderer',
@@ -6718,47 +6719,134 @@ html.${APP_ID}-fs-active body {
     }
   }
 
-  function syncManualShortsPoop(reason = 'route') {
-    cancelManualPoop(reason);
-    if (!CONFIG.shortsManualPoopEnabled) return;
-    if (!manualPoop.button && manualPoopEnabled()) {
+  function mountManualShortsPoop() {
+    if (!manualPoopEnabled() || document.hidden) return;
+    manualPoop.mountAttempts += 1;
+    const context = getManualShortContext();
+    const scope = context?.root || document;
+    const bars = Array.from(scope.querySelectorAll([
+      '.ytReelPlayerOverlayViewModelActionsContainer reel-action-bar-view-model',
+      'reel-action-bar-view-model',
+    ].join(','))).filter(isElementVisible);
+    if (!bars.length) {
+      bars.push(...Array.from(scope.querySelectorAll('.ytReelPlayerOverlayViewModelActionsContainer')).filter(isElementVisible));
+    }
+    // A preloaded/sibling reel must not receive the button.
+    if (bars.length !== 1) { manualPoop.uiStatus = 'waiting-action-bar'; return; }
+    const bar = bars[0];
+    if (!manualPoop.button) {
       const style = document.createElement('style');
       style.id = 'cu-shorts-manual-poop-style';
       style.textContent = `
-        #cu-shorts-manual-poop { position: fixed; right: 12px; top: 74px;
-          z-index: 2100; width: 48px; height: 48px; padding: 0; border: 0;
-          border-radius: 50%; background: rgba(20,20,20,.65); color: white;
-          font: 30px/48px system-ui; cursor: pointer; touch-action: manipulation; }
+        #cu-shorts-manual-poop-slot { flex: 0 0 auto; }
+        #cu-shorts-manual-poop { width: 48px; height: 48px; padding: 0; border: 0;
+          border-radius: 50%; background: rgba(20,20,20,.65); color: #fff;
+          display: flex; align-items: center; justify-content: center;
+          cursor: pointer; touch-action: manipulation; }
+        #cu-shorts-manual-poop svg { width: 24px; height: 24px; fill: none !important;
+          stroke: currentColor; pointer-events: none; }
+        #cu-shorts-manual-poop-slot .cu-poop-label { color: #fff; font: 12px/1.2 Roboto,Arial,sans-serif; }
         #cu-shorts-manual-poop:disabled { opacity: .45; }
-        #cu-shorts-manual-poop[hidden] { display: none !important; }
+        #cu-shorts-manual-poop-slot[hidden] { display: none !important; }
       `;
       (document.head || document.documentElement).appendChild(style);
+      const slot = document.createElement('div');
+      slot.id = 'cu-shorts-manual-poop-slot';
+      slot.className = 'ytSpecButtonViewModelHost ytwReelActionBarViewModelHostMobileActionButton';
+      const wrapper = document.createElement('label');
+      wrapper.className = 'ytSpecButtonShapeWithLabelHost ytSpecButtonShapeWithLabelIsOverlay';
       const button = document.createElement('button');
       button.id = 'cu-shorts-manual-poop';
       button.type = 'button';
-      button.textContent = '💩';
+      button.className = 'ytSpecButtonShapeNextHost ytSpecButtonShapeNextText ytSpecButtonShapeNextOverlay ytSpecButtonShapeNextSizeS ytSpecButtonShapeNextIconButton ytSpecButtonShapeNextOverrideSmallSizeIcon ytSpecButtonShapeNextMainstageIconSize ytSpecButtonShapeNextMainstagePadding';
+      const icon = document.createElement('div');
+      icon.className = 'ytSpecButtonShapeNextIcon ytSpecButtonShapeNextElevatedContent';
+      icon.setAttribute('aria-hidden', 'true');
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      for (const [name, value] of Object.entries({ width: '24', height: '24', viewBox: '0 0 24 24',
+        fill: 'none', stroke: 'currentColor', 'stroke-width': '2', 'stroke-linecap': 'round',
+        'stroke-linejoin': 'round', class: 'icon icon-tabler icons-tabler-outline icon-tabler-poo',
+        focusable: 'false', 'aria-hidden': 'true' })) svg.setAttribute(name, value);
+      for (const d of ['M0 0h24v24H0z', 'M10 12h.01', 'M14 12h.01',
+        'M10 16a3.5 3.5 0 0 0 4 0',
+        'M11 4c2 0 3.5 1.5 3.5 4l.164 0a2.5 2.5 0 0 1 2.196 3.32a3 3 0 0 1 1.615 3.063a3 3 0 0 1 -1.299 5.607l-.176 0h-10a3 3 0 0 1 -1.474 -5.613a3 3 0 0 1 1.615 -3.062a2.5 2.5 0 0 1 2.195 -3.32l.164 0c1.5 0 2.5 -2 1.5 -4l0 .005']) {
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', d);
+        if (d === 'M0 0h24v24H0z') { path.setAttribute('stroke', 'none'); path.setAttribute('fill', 'none'); }
+        svg.appendChild(path);
+      }
+      icon.appendChild(svg);
+      button.appendChild(icon);
       button.title = 'В ЧС и «Не интересует»';
       button.setAttribute('aria-label', 'Скрыть Shorts и его канал');
       button.addEventListener('click', event => {
         event.preventDefault(); event.stopPropagation();
-        void handleManualShortsPoop();
+        void handleManualShortsPoop().catch(error => recordManualPoopUiError(error));
       });
+      const label = document.createElement('span');
+      label.className = 'ytSpecButtonShapeWithLabelLabel cu-poop-label';
+      label.textContent = 'ЧС';
+      label.setAttribute('aria-hidden', 'true');
+      wrapper.append(button, label);
+      slot.appendChild(wrapper);
+      manualPoop.slot = slot;
       manualPoop.button = button;
     }
-    if (manualPoop.button) {
-      if (!manualPoop.button.isConnected) (document.body || document.documentElement).appendChild(manualPoop.button);
-      manualPoop.button.hidden = !manualPoopEnabled() || document.hidden;
+    if (manualPoop.slot.parentElement !== bar) {
+      bar.insertBefore(manualPoop.slot, bar.querySelector('pivot-button-view-model'));
     }
-    if (!manualPoop.bound) {
+    if (manualPoop.slot.hidden) manualPoop.slot.hidden = false;
+    manualPoop.uiStatus = 'mounted';
+    manualPoop.uiError = '';
+  }
+
+  function recordManualPoopUiError(error) {
+    manualPoop.uiStatus = 'error';
+    manualPoop.uiError = String(error?.message || error);
+    log('manual Shorts UI isolated error', manualPoop.uiError);
+  }
+
+  function scheduleManualShortsPoop(reason = 'route') {
+    try {
+      cancelManualPoop(reason);
+      for (const timer of manualPoop.mountTimers) clearTimeout(timer);
+      manualPoop.mountTimers = [];
+      if (!manualPoopEnabled() || document.hidden) {
+        if (manualPoop.slot && !manualPoop.slot.hidden) manualPoop.slot.hidden = true;
+        manualPoop.uiStatus = 'inactive';
+        return;
+      }
+      manualPoop.uiStatus = 'scheduled';
+      // No synchronous DOM insertion in YouTube's navigation callback. Three
+      // bounded attempts after native UI startup; no recurring observer/scanner.
+      for (const delay of [500, 1500, 3000]) {
+        const timer = setTimeout(() => {
+          manualPoop.mountTimers = manualPoop.mountTimers.filter(id => id !== timer);
+          try { mountManualShortsPoop(); } catch (error) { recordManualPoopUiError(error); }
+        }, delay);
+        manualPoop.mountTimers.push(timer);
+      }
+    } catch (error) { recordManualPoopUiError(error); }
+  }
+
+  function bindManualShortsPoopSignals() {
+    if (manualPoop.bound) return;
+    try {
       manualPoop.bound = true;
-      // Any real gesture elsewhere yields to the user immediately, including a
-      // swipe before YouTube has had time to update URL/player metadata.
       const interrupt = event => {
         if (manualPoop.action && !manualPoop.button?.contains(event.target)) cancelManualPoop('user-gesture');
       };
       document.addEventListener('pointerdown', interrupt, { capture: true, passive: true });
       document.addEventListener('touchstart', interrupt, { capture: true, passive: true });
-    }
+      // Playback can start after all route retries have finished. One event-driven
+      // retry burst is sufficient; don't read/write video volume here.
+      document.addEventListener('playing', event => {
+        if (manualPoopEnabled() && String(event.target?.tagName).toLowerCase() === 'video' &&
+          !manualPoop.slot?.isConnected && !manualPoop.mountTimers.length) scheduleManualShortsPoop('playing');
+      }, { capture: true, passive: true });
+      document.addEventListener('visibilitychange', () => scheduleManualShortsPoop('visibility'));
+      scheduleManualShortsPoop('init');
+    } catch (error) { recordManualPoopUiError(error); }
   }
 
   window.cuShortsPoopInfo = function cuShortsPoopInfo() {
@@ -6769,6 +6857,8 @@ html.${APP_ID}-fs-active body {
     return { enabled: CONFIG.shortsManualPoopEnabled, active: manualPoopEnabled(),
       busy: Boolean(manualPoop.action), currentVideoId: context?.videoId || '',
       currentChannel: context?.channel || null, blacklist, lastResult: manualPoop.lastResult,
+      uiStatus: manualPoop.uiStatus, uiError: manualPoop.uiError,
+      mountAttempts: manualPoop.mountAttempts, pendingMounts: manualPoop.mountTimers.length,
       autoSkipEnabled: false };
   };
   window.cuShortsManualBlacklist = function cuShortsManualBlacklist() { return readManualShortsBlacklist(); };
@@ -8616,7 +8706,7 @@ html.${APP_ID}-fs-active body {
     if (href === state.currentUrl) return;
 
     state.currentUrl = href;
-    syncManualShortsPoop(reason);
+    scheduleManualShortsPoop(reason);
     syncHomeDatesRoute();
     updateShortsRouteClass(reason);
     state.videoId = '';
@@ -8799,7 +8889,7 @@ html.${APP_ID}-fs-active body {
 
     return {
       app: APP_SHORT,
-      version: '0.3.27',
+      version: '0.3.28',
       url: location.href,
       videoId: getVideoIdFromUrl(),
       landscape: isLandscape(),
@@ -9226,7 +9316,7 @@ html.${APP_ID}-fs-active body {
     bindHomePreviewStopper();
     bindShortsSafeVolumeSync();
     bindGlobalSponsorMediaSignals();
-    syncManualShortsPoop('init');
+    bindManualShortsPoopSignals();
 
     if (isShortsSafeModePage()) {
       stopShortsRuntimeTasks('init');
@@ -9264,7 +9354,6 @@ html.${APP_ID}-fs-active body {
     }
 
     document.addEventListener('visibilitychange', () => {
-      syncManualShortsPoop('visibility');
       if (document.hidden) {
         stopNativeAdPoll('hidden');
         return;
